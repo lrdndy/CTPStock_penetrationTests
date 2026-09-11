@@ -1,0 +1,4 @@
+Source package: CTPStockConnectivity_v0.1.0.zip
+MD5: b43f0811692b1c94e573c4e472b0d917
+SHA256: c7cf53a55f8fdda22e7c6cfbb733d631cfcfd2000c72539362758438d3c2a281
+This is a source + SDK snapshot, not a final compiled evaluation package.

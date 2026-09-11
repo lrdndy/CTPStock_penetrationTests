@@ -1,0 +1,60 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"jsonFile" : "directory-.-Debug-d0094a50bb2071803777.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.24"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0
+					]
+				}
+			],
+			"name" : "Debug",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "CTPStockConnectivity",
+					"targetIndexes" : 
+					[
+						0
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "ctp_stock_connect::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ctp_stock_connect-Debug-d3011e8c9ebe2d38076c.json",
+					"name" : "ctp_stock_connect",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "D:/projects/CTPStock_API/CTPStockConnectivity_v0.1.0/CTPStockConnectivity/out/build/x64-Debug",
+		"source" : "D:/projects/CTPStock_API/CTPStockConnectivity_v0.1.0/CTPStockConnectivity"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 8
+	}
+}

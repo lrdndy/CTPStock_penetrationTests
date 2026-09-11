@@ -1,0 +1,10 @@
+/build*/
+/logs/
+/flow/
+/dist/
+*.local.ini
+*.log
+.env
+.vs/
+*.suo
+*.user

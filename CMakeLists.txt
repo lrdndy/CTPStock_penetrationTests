@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.24)
+project(CTPStockConnectivity VERSION 0.1.0 LANGUAGES CXX)
+if(NOT WIN32 OR NOT MSVC)
+  message(FATAL_ERROR "This deliverable targets Windows x64 MSVC and the supplied stock-options DLLs.")
+endif()
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  message(FATAL_ERROR "Use an x64 generator or x64 developer command prompt.")
+endif()
+add_executable(ctp_stock_connect src/main.cpp)
+target_compile_features(ctp_stock_connect PRIVATE cxx_std_17)
+target_compile_definitions(ctp_stock_connect PRIVATE WIN32 ISLIB NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(ctp_stock_connect PRIVATE /W4 /utf-8)
+target_include_directories(ctp_stock_connect SYSTEM PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/sdk/include")
+target_link_libraries(ctp_stock_connect PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/sdk/win64/soptthosttraderapi_se.lib"
+  "${CMAKE_CURRENT_SOURCE_DIR}/sdk/win64/soptthostmduserapi_se.lib"
+  advapi32)
+set_property(TARGET ctp_stock_connect PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_target_properties(ctp_stock_connect PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+  set_target_properties(ctp_stock_connect PROPERTIES RUNTIME_OUTPUT_DIRECTORY_${config} "${CMAKE_BINARY_DIR}/bin")
+endforeach()
+foreach(dll soptthosttraderapi_se.dll soptthostmduserapi_se.dll)
+  add_custom_command(TARGET ctp_stock_connect POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/sdk/win64/${dll}" "$<TARGET_FILE_DIR:ctp_stock_connect>/${dll}")
+endforeach()
