@@ -187,16 +187,19 @@ int main(int argc, char** argv) {
             const auto output = clean("bad " + secret.password + "\n" + secret.auth + "\t" + secret.password, secret);
             require(output == "bad [REDACTED] [REDACTED] [REDACTED]", "Credential or control character leaked");
         });
-        test("logs replace every non-ASCII byte", [] {
+        test("logs preserve UTF-8 text", [] {
             Secrets secret;
-            const auto output = clean(std::string("counter=") + std::string("\xD2\xD1", 2) + "5009", secret);
-            require(output == "counter=??5009", "Non-ASCII bytes reached the log output");
+            const std::string message = std::string("message=") + u8"正确";
+            require(clean(message, secret) == message, "UTF-8 log text changed");
         });
-        test("external messages omit local text but preserve numeric hints", [] {
-            require(externalMessage("CTP:No Error") == "CTP:No Error", "ASCII SDK message changed");
-            const auto local = std::string("\xD2\xD1\xB3\xB7", 4) + "5009";
-            require(externalMessage(local) == "NON_ASCII_OMITTED numeric_tokens=5009",
-                    "Localized SDK message was not safely summarized");
+        test("SDK text follows the platform encoding contract", [] {
+            require(sdkText("CTP:No Error") == "CTP:No Error", "ASCII SDK message changed");
+            const std::string gbkCorrect("\xD5\xFD\xC8\xB7", 4);
+#ifdef _WIN32
+            require(sdkText(gbkCorrect) == u8"正确", "Windows CP936 message did not convert to UTF-8");
+#else
+            require(sdkText(gbkCorrect) == gbkCorrect, "Non-Windows SDK message changed");
+#endif
         });
         test("order status codes have English names", [] {
             require(std::string(orderSubmitStatusName(THOST_FTDC_OSS_InsertRejected)) == "INSERT_REJECTED",

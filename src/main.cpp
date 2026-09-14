@@ -34,7 +34,7 @@
 using namespace ctp_sopt;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock; // 超时用单调时钟，避免系统校时影响等待时间。
-constexpr const char* kVersion = "v0.2.1";
+constexpr const char* kVersion = "v0.2.2";
 constexpr const char* kTraderFront = "tcp://101.226.254.157:32205";
 constexpr const char* kMdFront = "tcp://101.226.254.157:32213";
 
@@ -281,7 +281,7 @@ std::string timestamp(bool filename = false) {
     return out.str();
 }
 std::string clean(std::string s, const Secrets& secret) {
-    // 先脱敏，再把日志限制为单行可打印 ASCII；远端本地编码文本不能污染控制台或伪造日志行。
+    // 先脱敏，再移除换行和控制字符；保留已经转换为 UTF-8 的中文消息。
     for (const auto* value : {&secret.password, &secret.auth}) {
         if (value->empty()) continue;
         std::size_t pos = 0;
@@ -289,45 +289,29 @@ std::string clean(std::string s, const Secrets& secret) {
             s.replace(pos, value->size(), "[REDACTED]"); pos += 10;
         }
     }
-    for (char& ch : s) {
-        const auto byte = static_cast<unsigned char>(ch);
-        if (byte < 32 || byte == 127) ch = ' ';
-        else if (byte > 126) ch = '?';
-    }
+    for (char& ch : s) if (static_cast<unsigned char>(ch) < 32 || ch == 127) ch = ' ';
     return s;
 }
-std::string externalMessage(std::string raw) {
-    const bool printableAscii = !raw.empty() && std::all_of(raw.begin(), raw.end(), [](char ch) {
-        const auto byte = static_cast<unsigned char>(ch);
-        return byte >= 32 && byte <= 126;
-    });
-    if (printableAscii) return raw;
-
-    // 柜台中文通常使用 GBK。日志不输出原文，只保留不会与 GBK 尾字节混淆的连续数字错误线索。
-    std::vector<std::string> numbers;
-    std::string number;
-    for (const char ch : raw) {
-        if (ch >= '0' && ch <= '9') {
-            number.push_back(ch);
-        } else if (!number.empty()) {
-            if (number.size() >= 2) numbers.push_back(number);
-            number.clear();
+std::string sdkText(std::string raw) {
+#ifdef _WIN32
+    // Windows 股票期权 SDK 的本地语言文本使用 GBK/CP936；统一转为 UTF-8 后再显示和写日志。
+    if (raw.empty()) return raw;
+    const int wideChars = MultiByteToWideChar(936, 0, raw.data(), static_cast<int>(raw.size()), nullptr, 0);
+    if (wideChars > 0) {
+        std::wstring wide(wideChars, L'\0');
+        MultiByteToWideChar(936, 0, raw.data(), static_cast<int>(raw.size()), wide.data(), wideChars);
+        const int utf8Bytes = WideCharToMultiByte(CP_UTF8, 0, wide.data(), wideChars, nullptr, 0, nullptr, nullptr);
+        if (utf8Bytes > 0) {
+            std::string utf8(utf8Bytes, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, wide.data(), wideChars, utf8.data(), utf8Bytes, nullptr, nullptr);
+            return utf8;
         }
     }
-    if (number.size() >= 2) numbers.push_back(number);
-
-    std::string result = raw.empty() ? "EMPTY" : "NON_ASCII_OMITTED";
-    if (!numbers.empty()) {
-        result += " numeric_tokens=";
-        for (std::size_t i = 0; i < numbers.size(); ++i) {
-            if (i != 0) result += ',';
-            result += numbers[i];
-        }
-    }
-    return result;
+#endif
+    return raw;
 }
 std::string sdkMessage(const CThostFtdcRspInfoField& info) {
-    return externalMessage(textField(info.ErrorMsg));
+    return sdkText(textField(info.ErrorMsg));
 }
 const char* orderSubmitStatusName(char status) {
     switch (status) {
@@ -677,7 +661,7 @@ public:
              << " order_status=" << orderStatusName(p->OrderStatus)
              << " original_volume=" << p->VolumeTotalOriginal << " traded_volume=" << p->VolumeTraded
              << " remaining_volume=" << p->VolumeTotal
-             << " external_status=" << externalMessage(textField(p->StatusMsg));
+             << " status_msg=" << sdkText(textField(p->StatusMsg));
         log_.write(line.str());
         if (order_) order_->returnedOrder(p);
     }

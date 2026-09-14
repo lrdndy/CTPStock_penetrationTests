@@ -1,5 +1,11 @@
 # 交付验证记录
 
+## v0.2.2：中文 SDK 消息正常显示
+
+- Windows SDK 返回的 GBK/CP936 `ErrorMsg` 和 `StatusMsg` 统一转换为 UTF-8，控制台与日志保留可读中文，不再显示乱码或 `NON_ASCII_OMITTED`。
+- `OnRtnOrder` 继续同时记录原始状态字符与英文枚举名，中文 `status_msg` 作为柜台原始解释保留。
+- 离线回归改为验证 UTF-8 日志保留及跨平台 SDK 文本处理契约；全部 30 项通过。Windows CP936 转换分支仍需在用户 Windows 实机重新构建后核验。
+
 ## v0.2.1：纯英文运行日志
 
 - 所有运行日志在凭据脱敏后统一限制为可打印 ASCII，避免 Windows 控制台因柜台 GBK 文本出现乱码或把外部控制字符写入证据日志。
