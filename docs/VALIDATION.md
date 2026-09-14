@@ -1,5 +1,12 @@
 # 交付验证记录
 
+## v0.2.1：纯英文运行日志
+
+- 所有运行日志在凭据脱敏后统一限制为可打印 ASCII，避免 Windows 控制台因柜台 GBK 文本出现乱码或把外部控制字符写入证据日志。
+- `OnRtnOrder` 同时记录原始状态字符和英文枚举名，例如 `submit_status_code=4 submit_status=INSERT_REJECTED`、`order_status_code=5 order_status=CANCELED`。
+- `ErrorMsg` 与 `StatusMsg` 若为纯 ASCII 则保留；若包含非 ASCII 字节则不输出原始文本，只标记 `NON_ASCII_OMITTED`，并保留其中连续的数字错误线索，例如 `numeric_tokens=5009`。
+- 新增 3 项离线回归，验证 ASCII 输出约束、本地语言消息摘要及订单状态英文映射；连同原有测试共 30 项通过，POSIX 隐藏输入检查通过。
+
 ## v0.2.0：1.1 基础功能测试
 
 - 新增 `--test basic` 的 `single-shot-limit` 单次策略：使用明确的合约、交易所、方向、开平和限价生成一笔 `VolumeTotalOriginal=1` 的 GFD 限价单。

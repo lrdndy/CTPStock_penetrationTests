@@ -34,7 +34,7 @@
 using namespace ctp_sopt;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock; // 超时用单调时钟，避免系统校时影响等待时间。
-constexpr const char* kVersion = "v0.2.0";
+constexpr const char* kVersion = "v0.2.1";
 constexpr const char* kTraderFront = "tcp://101.226.254.157:32205";
 constexpr const char* kMdFront = "tcp://101.226.254.157:32213";
 
@@ -281,7 +281,7 @@ std::string timestamp(bool filename = false) {
     return out.str();
 }
 std::string clean(std::string s, const Secrets& secret) {
-    // 先脱敏，再移除换行和控制字符，避免远端 ErrorMsg 注入伪造日志行。
+    // 先脱敏，再把日志限制为单行可打印 ASCII；远端本地编码文本不能污染控制台或伪造日志行。
     for (const auto* value : {&secret.password, &secret.auth}) {
         if (value->empty()) continue;
         std::size_t pos = 0;
@@ -289,26 +289,71 @@ std::string clean(std::string s, const Secrets& secret) {
             s.replace(pos, value->size(), "[REDACTED]"); pos += 10;
         }
     }
-    for (char& ch : s) if (static_cast<unsigned char>(ch) < 32 || ch == 127) ch = ' ';
+    for (char& ch : s) {
+        const auto byte = static_cast<unsigned char>(ch);
+        if (byte < 32 || byte == 127) ch = ' ';
+        else if (byte > 126) ch = '?';
+    }
     return s;
 }
-std::string sdkMessage(const CThostFtdcRspInfoField& info) {
-    std::string raw = textField(info.ErrorMsg);
-#ifdef _WIN32
-    // 这套 Windows SDK 的中文错误信息按 GBK/CP936 转成 UTF-8 显示和写入日志。
-    const int n = MultiByteToWideChar(936, 0, raw.data(), static_cast<int>(raw.size()), nullptr, 0);
-    if (n > 0) {
-        std::wstring wide(n, L'\0');
-        MultiByteToWideChar(936, 0, raw.data(), static_cast<int>(raw.size()), wide.data(), n);
-        const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide.data(), n, nullptr, 0, nullptr, nullptr);
-        if (bytes > 0) {
-            std::string utf8(bytes, '\0');
-            WideCharToMultiByte(CP_UTF8, 0, wide.data(), n, utf8.data(), bytes, nullptr, nullptr);
-            return utf8;
+std::string externalMessage(std::string raw) {
+    const bool printableAscii = !raw.empty() && std::all_of(raw.begin(), raw.end(), [](char ch) {
+        const auto byte = static_cast<unsigned char>(ch);
+        return byte >= 32 && byte <= 126;
+    });
+    if (printableAscii) return raw;
+
+    // 柜台中文通常使用 GBK。日志不输出原文，只保留不会与 GBK 尾字节混淆的连续数字错误线索。
+    std::vector<std::string> numbers;
+    std::string number;
+    for (const char ch : raw) {
+        if (ch >= '0' && ch <= '9') {
+            number.push_back(ch);
+        } else if (!number.empty()) {
+            if (number.size() >= 2) numbers.push_back(number);
+            number.clear();
         }
     }
-#endif
-    return raw;
+    if (number.size() >= 2) numbers.push_back(number);
+
+    std::string result = raw.empty() ? "EMPTY" : "NON_ASCII_OMITTED";
+    if (!numbers.empty()) {
+        result += " numeric_tokens=";
+        for (std::size_t i = 0; i < numbers.size(); ++i) {
+            if (i != 0) result += ',';
+            result += numbers[i];
+        }
+    }
+    return result;
+}
+std::string sdkMessage(const CThostFtdcRspInfoField& info) {
+    return externalMessage(textField(info.ErrorMsg));
+}
+const char* orderSubmitStatusName(char status) {
+    switch (status) {
+    case THOST_FTDC_OSS_InsertSubmitted: return "INSERT_SUBMITTED";
+    case THOST_FTDC_OSS_CancelSubmitted: return "CANCEL_SUBMITTED";
+    case THOST_FTDC_OSS_ModifySubmitted: return "MODIFY_SUBMITTED";
+    case THOST_FTDC_OSS_Accepted: return "ACCEPTED";
+    case THOST_FTDC_OSS_InsertRejected: return "INSERT_REJECTED";
+    case THOST_FTDC_OSS_CancelRejected: return "CANCEL_REJECTED";
+    case THOST_FTDC_OSS_ModifyRejected: return "MODIFY_REJECTED";
+    default: return "UNKNOWN_CODE";
+    }
+}
+const char* orderStatusName(char status) {
+    switch (status) {
+    case THOST_FTDC_OST_AllTraded: return "ALL_TRADED";
+    case THOST_FTDC_OST_PartTradedQueueing: return "PART_TRADED_QUEUEING";
+    case THOST_FTDC_OST_PartTradedNotQueueing: return "PART_TRADED_NOT_QUEUEING";
+    case THOST_FTDC_OST_NoTradeQueueing: return "NO_TRADE_QUEUEING";
+    case THOST_FTDC_OST_NoTradeNotQueueing: return "NO_TRADE_NOT_QUEUEING";
+    case THOST_FTDC_OST_Canceled: return "CANCELED";
+    case THOST_FTDC_OST_Unknown: return "UNKNOWN";
+    case THOST_FTDC_OST_NotTouched: return "NOT_TOUCHED";
+    case THOST_FTDC_OST_Touched: return "TOUCHED";
+    default: return "UNKNOWN_CODE";
+    }
 }
 class Logger {
     std::ofstream file_;
@@ -626,9 +671,13 @@ public:
         line << "TRADER CALLBACK OnRtnOrder order_ref=" << textField(p->OrderRef)
              << " instrument=" << textField(p->InstrumentID) << " exchange=" << textField(p->ExchangeID)
              << " order_sys_id=" << textField(p->OrderSysID)
-             << " submit_status=" << p->OrderSubmitStatus << " order_status=" << p->OrderStatus
+             << " submit_status_code=" << p->OrderSubmitStatus
+             << " submit_status=" << orderSubmitStatusName(p->OrderSubmitStatus)
+             << " order_status_code=" << p->OrderStatus
+             << " order_status=" << orderStatusName(p->OrderStatus)
              << " original_volume=" << p->VolumeTotalOriginal << " traded_volume=" << p->VolumeTraded
-             << " remaining_volume=" << p->VolumeTotal << " status_msg=" << textField(p->StatusMsg);
+             << " remaining_volume=" << p->VolumeTotal
+             << " external_status=" << externalMessage(textField(p->StatusMsg));
         log_.write(line.str());
         if (order_) order_->returnedOrder(p);
     }
