@@ -1,6 +1,6 @@
 # 股票期权 API 连接测试第一阶段
 
-本项目是为附件六股票期权接入测试准备的第一步：在 Windows 64 位实体机上验证交易前置连接、客户端认证、账户登录、资金查询，以及行情前置连接和登录。源码版本为 `0.1.1`。本包包含源码和原始 Windows SDK 依赖，需要在 Windows 上编译生成 EXE。
+本项目是为附件六股票期权接入测试准备的第一步：在 Windows 64 位实体机上验证交易前置连接、客户端认证、账户登录、资金查询，以及行情前置连接和登录。源码版本为 `0.1.2`，绑定个股期权 SDK `v3.7.5_CP_20251125`。公开仓库包含源码、头文件、LIB 和错误码文件；两只原厂运行时 DLL 需从用户持有的 SDK 压缩包复制到本地，再在 Windows 上编译生成 EXE。
 
 本阶段没有报单、撤单、密码修改、结算确认、策略或风控交易功能，也不订阅行情。行情登录成功只能证明行情登录链路；要证明行情推送，需要下一阶段指定有效合约并收到行情回调。附件六后续范围见 [REPORT_ROADMAP.md](docs/REPORT_ROADMAP.md)。
 
@@ -10,7 +10,27 @@
 
 1. 将工程解压到例如 `D:\projects\CTPStockConnectivity`。建议初次使用短的英文路径。
 2. 在 Windows 实体机安装带“使用 C++ 的桌面开发”和 Windows SDK 的 Visual Studio 或 Build Tools。使用 x64 工具链。
-3. 以管理员身份打开 PowerShell，进入工程根目录后执行：
+3. 从 `traderAPI_3.7.5_CP_20251125(1).zip` 的下列目录复制两只 DLL：
+
+```text
+3.7.5_CP_api_20251125_win\20251125_traderapi64_windows_se\
+```
+
+将以下两个文件放到工程的 `sdk\win64\` 目录（不要使用 32 位目录，也不要使用 3.7.0 DLL）：
+
+```text
+soptthosttraderapi_se.dll
+soptthostmduserapi_se.dll
+```
+
+最终位置应为：
+
+```text
+D:\projects\CTPStockConnectivity\sdk\win64\soptthosttraderapi_se.dll
+D:\projects\CTPStockConnectivity\sdk\win64\soptthostmduserapi_se.dll
+```
+
+4. 以管理员身份打开 PowerShell，进入工程根目录后执行：
 
 ```powershell
 cd D:\projects\CTPStockConnectivity
@@ -25,7 +45,9 @@ notepad config\connection.local.ini
 .\run_windows.bat --mode all
 ```
 
-`build_windows.bat` 自动寻找 Visual Studio 并调用 x64 编译器，不依赖 CMake。成功后生成 `build\bin\ctp_stock_connect.exe`，同时复制两只 DLL。源码中包含中文注释，编译采用 UTF-8 头文件副本。
+`build_windows.bat` 会先检查两只本地 DLL，再自动寻找 Visual Studio 并调用 x64 编译器，不依赖 CMake。成功后生成 `build\bin\ctp_stock_connect.exe`，同时把两只 DLL 复制到该目录。源码中包含中文注释，编译采用 UTF-8 头文件副本。
+
+升级或重新解压工程后必须先重新编译，不能继续使用旧的 `build\bin`。编译完成后执行 `run_windows.bat --version`，Trader API 和 MD API 都应显示 `v3.7.5_CP_20251125  9:30:02.f7e78374`；若仍显示 3.7.0，说明运行目录中仍残留旧 DLL。
 
 填好本地配置后，程序自动读取交易密码和 AuthCode，每次运行不再要求输入。认证码使用邮件中箭头右侧的值，不包含箭头或 APPID。只有必需凭据既未配置、也未通过环境变量提供时，程序才会隐藏输入提示；输入时不显示字符属于正常现象。日志保留完整账号以便登录截图核验，所以向他人发送日志前仍需检查内容。
 
@@ -44,7 +66,7 @@ notepad config\connection.local.ini
 | trader_front | tcp://101.226.254.157:32205 | 交易评测前置 |
 | md_front | tcp://101.226.254.157:32213 | 行情评测前置 |
 
-AppID 中的 `v1.0.0` 是已申请的标识组成部分，不能因为样例源码版本是 `0.1.1` 就随意修改。投资者代码若与登录账号不同，应按中信提供的值修改 `investor_id`。第一阶段程序只允许上述评测前置和 BrokerID，不支持将配置直接切到生产环境。
+AppID 中的 `v1.0.0` 是已申请的标识组成部分，不能因为样例源码版本是 `0.1.2` 就随意修改。投资者代码若与登录账号不同，应按中信提供的值修改 `investor_id`。第一阶段程序只允许上述评测前置和 BrokerID，不支持将配置直接切到生产环境。
 
 `config/connection.local.ini` 用来保存本机凭据，内容如下（将占位文字换成真实值）：
 
@@ -140,7 +162,7 @@ Windows 编译成功后，可以制作此阶段运行包：
 | config/connection.ini | 账号标识、APPID 和评测地址 |
 | config/connection.local.ini.example | 本机密码和 AuthCode 的空模板，首次复制后填写 |
 | config/connection.local.ini | 本机填写的凭据，不提交到 Git，也不放入运行包 |
-| sdk/win64 | 用户附件的原始 Windows 64 位 SDK |
+| sdk/win64 | Windows 64 位头文件、LIB 和错误码文件；两只 3.7.5 DLL 由用户从原包复制到本地且不提交 Git |
 | sdk/include | 编译使用的 UTF-8 头文件副本，声明不变 |
 | build_windows.bat | 自动查找 Visual Studio 并编译 |
 | run_windows.bat | 设置工作目录与控制台编码后启动 |

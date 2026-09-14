@@ -4,6 +4,8 @@
 /dist/
 *.local.ini
 *.log
+sdk/win64/soptthosttraderapi_se.dll
+sdk/win64/soptthostmduserapi_se.dll
 .env
 .vs/
 *.suo

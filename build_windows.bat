@@ -1,6 +1,17 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+rem Vendor runtime DLLs are intentionally not stored in the public repository.
+if not exist sdk\win64\soptthosttraderapi_se.dll (
+  echo ERROR: Missing sdk\win64\soptthosttraderapi_se.dll
+  echo Copy the Windows x64 v3.7.5_CP_20251125 DLL from the vendor SDK package into sdk\win64.
+  exit /b 1
+)
+if not exist sdk\win64\soptthostmduserapi_se.dll (
+  echo ERROR: Missing sdk\win64\soptthostmduserapi_se.dll
+  echo Copy the Windows x64 v3.7.5_CP_20251125 DLL from the vendor SDK package into sdk\win64.
+  exit /b 1
+)
 rem Locate a Visual Studio installation with the x64 C++ toolchain.
 rem Direct cl build: CMake is not required.
 set "CTP_VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"

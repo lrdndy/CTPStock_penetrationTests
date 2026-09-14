@@ -1,0 +1,5 @@
+# Preserve the vendor-supplied GB18030/CRLF SDK files byte-for-byte.
+sdk/win64/** binary
+
+# The compiler-facing header mirrors are intentionally UTF-8 with LF endings.
+sdk/include/*.h text eol=lf
