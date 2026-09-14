@@ -195,8 +195,55 @@ int main(int argc, char** argv) {
             rejects([&] { field(login.Password, "Dummy\t42", "Password"); }, "Invalid", "Dummy");
             rejects([&] { field(login.Password, std::string("Dummy\0" "42", 8), "Password"); }, "Invalid", "Dummy");
         });
+        test("MD login accepts callback request ID zero", [] {
+            State state;
+            CThostFtdcRspUserLoginField login{};
+            CThostFtdcRspInfoField info{};
+            Secrets secrets;
+            const fs::path logPath = testRoot / "md-zero-id" / "run.log";
+            fs::create_directories(logPath.parent_path());
+            Logger logger(logPath, secrets);
+            MdSpi spi(state, logger);
+            field(login.UserID, "MD_ZERO_ID", "UserID");
+            require(state.begin(Stage::Login, 1, 2), "Cannot begin MD login state");
+            spi.OnRspUserLogin(&login, &info, 0, true);
+            const Result result = state.wait();
+            require(result.ok, "MD login callback request ID zero was rejected");
+            require(result.acceptedZeroRequestId, "MD zero-ID compatibility was not recorded");
+            require(textField(result.login.UserID) == "MD_ZERO_ID", "MD login payload was not retained");
+            std::ifstream file(logPath, std::ios::binary);
+            std::ostringstream content;
+            content << file.rdbuf();
+            require(content.str().find("MD CALLBACK OnRspUserLogin callback_request_id=0") != std::string::npos,
+                    "Raw MD callback request ID was not logged before matching");
+        });
+        test("strict request matching still rejects callback ID zero", [] {
+            State state;
+            CThostFtdcRspUserLoginField wrong{}, correct{};
+            CThostFtdcRspInfoField info{};
+            field(wrong.UserID, "WRONG_ZERO", "UserID");
+            field(correct.UserID, "STRICT_OK", "UserID");
+            require(state.begin(Stage::Login, 2, 2), "Cannot begin strict login state");
+            state.response(Stage::Login, &wrong, &info, 0, true);
+            state.response(Stage::Login, &correct, &info, 2, true);
+            const Result result = state.wait();
+            require(result.ok, "Strict matching rejected the correct callback ID");
+            require(!result.acceptedZeroRequestId, "Strict matching incorrectly accepted callback ID zero");
+            require(textField(result.login.UserID) == "STRICT_OK", "Strict matching retained wrong response");
+        });
+        test("MD error callback accepts request ID zero", [] {
+            State state;
+            CThostFtdcRspInfoField info{};
+            info.ErrorID = 77;
+            require(state.begin(Stage::Login, 1, 2), "Cannot begin MD error state");
+            state.error(&info, 0, true, RequestIdPolicy::AllowZero);
+            const Result result = state.wait();
+            require(!result.ok && result.hasInfo && result.info.ErrorID == 77,
+                    "MD zero-ID error response was not retained");
+            require(result.acceptedZeroRequestId, "MD zero-ID error compatibility was not recorded");
+        });
         setTestEnv("");
-        std::cout << passed << " offline configuration tests passed; no SDK connection was attempted.\n";
+        std::cout << passed << " offline regression tests passed; no SDK connection was attempted.\n";
         return 0;
     } catch (...) {
         // Deliberately omit exception payloads to keep regression output secret-free.

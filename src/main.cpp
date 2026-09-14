@@ -33,7 +33,7 @@
 using namespace ctp_sopt;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock; // 超时用单调时钟，避免系统校时影响等待时间。
-constexpr const char* kVersion = "v0.1.2";
+constexpr const char* kVersion = "v0.1.3";
 constexpr const char* kTraderFront = "tcp://101.226.254.157:32205";
 constexpr const char* kMdFront = "tcp://101.226.254.157:32213";
 
@@ -226,11 +226,13 @@ std::string sdkMessage(const CThostFtdcRspInfoField& info) {
 class Logger {
     std::ofstream file_;
     const Secrets& secret_;
+    std::mutex mutex_;
 public:
     Logger(const fs::path& path, const Secrets& secret) : file_(path, std::ios::binary), secret_(secret) {
         if (!file_) throw std::runtime_error("Cannot create run log.");
     }
     void write(const std::string& message) {
+        std::lock_guard<std::mutex> lock(mutex_);
         const std::string line = timestamp() + " " + clean(message, secret_);
         std::cout << line << '\n';
         file_ << line << '\n'; file_.flush();
@@ -239,6 +241,7 @@ public:
 };
 
 enum class Stage { Connect, Authenticate, Login, Account };
+enum class RequestIdPolicy { Strict, AllowZero };
 const char* stageName(Stage s) {
     switch (s) {
     case Stage::Connect: return "connect"; case Stage::Authenticate: return "authenticate";
@@ -247,7 +250,7 @@ const char* stageName(Stage s) {
     return "unknown";
 }
 struct Result {
-    bool ok = false, hasInfo = false;
+    bool ok = false, hasInfo = false, acceptedZeroRequestId = false;
     std::string reason;
     CThostFtdcRspInfoField info{};
     CThostFtdcRspUserLoginField login{};
@@ -255,7 +258,8 @@ struct Result {
 };
 
 // API 回调在 SDK 线程执行。它们只复制数据和通知主线程，不等条件、不发下一条请求。
-// 一次只允许一个阶段在途；请求编号和阶段同时匹配，超时后收到的旧应答一律忽略。
+// 一次只允许一个阶段在途；默认要求请求编号和阶段同时匹配。
+// 已实测该股票期权行情前置把登录请求 1 的回调编号返回为 0，故仅 MD 登录显式兼容 0。
 class State {
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -268,8 +272,10 @@ class State {
     void finish(bool ok, const std::string& reason) {
         result_.ok = ok; result_.reason = reason; done_ = true; cv_.notify_all();
     }
-    bool matching(Stage stage, int request) const {
-        return active_ && !done_ && stage_ == stage && request_ == request && Clock::now() < deadline_;
+    bool matching(Stage stage, int request, RequestIdPolicy policy = RequestIdPolicy::Strict) const {
+        const bool requestMatches = request_ == request ||
+            (policy == RequestIdPolicy::AllowZero && request == 0);
+        return active_ && !done_ && stage_ == stage && requestMatches && Clock::now() < deadline_;
     }
 public:
     bool begin(Stage stage, int request, int timeout) {
@@ -293,9 +299,13 @@ public:
         // Req* 的返回值只说明本地提交是否成功，rc=0 并不表示认证/登录成功。
         if (rc != 0 && active_) finish(false, "request submission rejected; immediate_rc=" + std::to_string(rc));
     }
-    template <typename T> void response(Stage stage, T* data, CThostFtdcRspInfoField* info, int request, bool last) {
+    template <typename T> void response(Stage stage, T* data, CThostFtdcRspInfoField* info,
+                                        int request, bool last,
+                                        RequestIdPolicy policy = RequestIdPolicy::Strict) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!matching(stage, request)) return;
+        if (!matching(stage, request, policy)) return;
+        result_.acceptedZeroRequestId = result_.acceptedZeroRequestId ||
+            (policy == RequestIdPolicy::AllowZero && request == 0 && request_ != 0);
         if (info && info->ErrorID != 0) {
             result_.info = *info; result_.hasInfo = true; finish(false, "asynchronous API error"); return;
         }
@@ -308,9 +318,12 @@ public:
         if (!data && stage != Stage::Account) finish(false, "final response has no required payload");
         else finish(true, "final response received"); // 资金查询允许 data=nullptr、bIsLast=true 的空结果。
     }
-    void error(CThostFtdcRspInfoField* info, int request, bool last) {
+    void error(CThostFtdcRspInfoField* info, int request, bool last,
+               RequestIdPolicy policy = RequestIdPolicy::Strict) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!matching(stage_, request)) return;
+        if (!matching(stage_, request, policy)) return;
+        result_.acceptedZeroRequestId = result_.acceptedZeroRequestId ||
+            (policy == RequestIdPolicy::AllowZero && request == 0 && request_ != 0);
         if (info && info->ErrorID != 0) {
             result_.info = *info; result_.hasInfo = true; finish(false, "OnRspError");
         } else if (last) finish(false, "OnRspError without a nonzero error code; no valid business response");
@@ -324,33 +337,71 @@ public:
     }
 };
 
+void logCallback(Logger& log, const char* channel, const char* name,
+                 int request, bool last, CThostFtdcRspInfoField* info) {
+    std::string message = std::string(channel) + " CALLBACK " + name +
+        " callback_request_id=" + std::to_string(request) +
+        " is_last=" + std::to_string(last ? 1 : 0);
+    if (info) {
+        message += " ErrorID=" + std::to_string(info->ErrorID) +
+                   " ErrorMsg=" + sdkMessage(*info);
+    } else {
+        message += " RspInfo=NULL";
+    }
+    log.write(message);
+}
+
 class TraderSpi final : public CThostFtdcTraderSpi {
     State& state_;
+    Logger& log_;
 public:
-    explicit TraderSpi(State& state) : state_(state) {}
-    void OnFrontConnected() override { state_.connected(); }
-    void OnFrontDisconnected(int reason) override { state_.disconnected(reason); }
+    TraderSpi(State& state, Logger& log) : state_(state), log_(log) {}
+    void OnFrontConnected() override { log_.write("TRADER CALLBACK OnFrontConnected"); state_.connected(); }
+    void OnFrontDisconnected(int reason) override {
+        log_.write("TRADER CALLBACK OnFrontDisconnected reason=" + std::to_string(reason));
+        state_.disconnected(reason);
+    }
+    void OnHeartBeatWarning(int lapse) override {
+        log_.write("TRADER CALLBACK OnHeartBeatWarning time_lapse=" + std::to_string(lapse));
+    }
     void OnRspAuthenticate(CThostFtdcRspAuthenticateField* p, CThostFtdcRspInfoField* e, int id, bool last) override {
+        logCallback(log_, "TRADER", "OnRspAuthenticate", id, last, e);
         state_.response(Stage::Authenticate, p, e, id, last);
     }
     void OnRspUserLogin(CThostFtdcRspUserLoginField* p, CThostFtdcRspInfoField* e, int id, bool last) override {
+        logCallback(log_, "TRADER", "OnRspUserLogin", id, last, e);
         state_.response(Stage::Login, p, e, id, last);
     }
     void OnRspQryTradingAccount(CThostFtdcTradingAccountField* p, CThostFtdcRspInfoField* e, int id, bool last) override {
+        logCallback(log_, "TRADER", "OnRspQryTradingAccount", id, last, e);
         state_.response(Stage::Account, p, e, id, last);
     }
-    void OnRspError(CThostFtdcRspInfoField* e, int id, bool last) override { state_.error(e, id, last); }
+    void OnRspError(CThostFtdcRspInfoField* e, int id, bool last) override {
+        logCallback(log_, "TRADER", "OnRspError", id, last, e);
+        state_.error(e, id, last);
+    }
 };
 class MdSpi final : public CThostFtdcMdSpi {
     State& state_;
+    Logger& log_;
 public:
-    explicit MdSpi(State& state) : state_(state) {}
-    void OnFrontConnected() override { state_.connected(); }
-    void OnFrontDisconnected(int reason) override { state_.disconnected(reason); }
-    void OnRspUserLogin(CThostFtdcRspUserLoginField* p, CThostFtdcRspInfoField* e, int id, bool last) override {
-        state_.response(Stage::Login, p, e, id, last);
+    MdSpi(State& state, Logger& log) : state_(state), log_(log) {}
+    void OnFrontConnected() override { log_.write("MD CALLBACK OnFrontConnected"); state_.connected(); }
+    void OnFrontDisconnected(int reason) override {
+        log_.write("MD CALLBACK OnFrontDisconnected reason=" + std::to_string(reason));
+        state_.disconnected(reason);
     }
-    void OnRspError(CThostFtdcRspInfoField* e, int id, bool last) override { state_.error(e, id, last); }
+    void OnHeartBeatWarning(int lapse) override {
+        log_.write("MD CALLBACK OnHeartBeatWarning time_lapse=" + std::to_string(lapse));
+    }
+    void OnRspUserLogin(CThostFtdcRspUserLoginField* p, CThostFtdcRspInfoField* e, int id, bool last) override {
+        logCallback(log_, "MD", "OnRspUserLogin", id, last, e);
+        state_.response(Stage::Login, p, e, id, last, RequestIdPolicy::AllowZero);
+    }
+    void OnRspError(CThostFtdcRspInfoField* e, int id, bool last) override {
+        logCallback(log_, "MD", "OnRspError", id, last, e);
+        state_.error(e, id, last, RequestIdPolicy::AllowZero);
+    }
 };
 template <typename Api> struct ApiDeleter {
     void operator()(Api* api) const {
@@ -362,6 +413,8 @@ template <typename Api> struct ApiDeleter {
 bool report(Logger& log, const char* channel, Stage stage, int id, const Result& r) {
     std::string message = std::string(channel) + " stage=" + stageName(stage) + " request_id=" + std::to_string(id) +
         " status=" + (r.ok ? "PASS" : "FAIL") + " " + r.reason;
+    if (r.acceptedZeroRequestId)
+        message += "; callback_request_id=0 accepted for MD compatibility";
     if (r.hasInfo) message += " ErrorID=" + std::to_string(r.info.ErrorID) + " ErrorMsg=" + sdkMessage(r.info);
     log.write(message);
     if (r.ok && stage == Stage::Login) {
@@ -403,7 +456,7 @@ CThostFtdcReqUserLoginField loginRequest(const Config& c, const Secrets& s) {
 }
 bool testTrader(const Config& c, const Secrets& s, const Options& o, const fs::path& flow, Logger& log) {
     State state;
-    TraderSpi spi(state);
+    TraderSpi spi(state, log);
     const std::string flowPath = flow.generic_string() + "/";
     std::string front = c.trader;
     CThostFtdcReqAuthenticateField auth{};
@@ -429,7 +482,7 @@ bool testTrader(const Config& c, const Secrets& s, const Options& o, const fs::p
 }
 bool testMd(const Config& c, const Secrets& s, const Options& o, const fs::path& flow, Logger& log) {
     State state;
-    MdSpi spi(state);
+    MdSpi spi(state, log);
     const std::string flowPath = flow.generic_string() + "/";
     std::string front = c.md;
     auto login = loginRequest(c, s);
