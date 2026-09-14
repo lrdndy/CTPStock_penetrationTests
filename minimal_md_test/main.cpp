@@ -20,6 +20,7 @@ using namespace ctp_sopt;
 
 namespace {
 
+// 固定使用本次评测的公开连接参数，只让操作者输入密码。
 constexpr char kFront[] = "tcp://101.226.254.157:32213";
 constexpr char kBrokerId[] = "1000";
 constexpr char kUserId[] = "887120202987";
@@ -95,6 +96,7 @@ public:
     void OnFrontConnected() override {
         log("CALLBACK OnFrontConnected");
 
+        // CTP 是异步接口：收到连接成功回调后，才提交一次登录请求。
         CThostFtdcReqUserLoginField request{};
         if (!copyField(request.BrokerID, kBrokerId, "BrokerID") ||
             !copyField(request.UserID, kUserId, "UserID") ||
@@ -105,6 +107,7 @@ public:
 
         log("CALL ReqUserLogin request_id=1");
         const int result = api_.ReqUserLogin(&request, kRequestId);
+        // 返回 0 只表示 SDK 接受请求；最终结果必须看 OnRspUserLogin。
         log("RETURN ReqUserLogin immediate_rc=" + std::to_string(result));
         if (result != 0) {
             finish(false);
@@ -115,6 +118,7 @@ public:
                         CThostFtdcRspInfoField* info,
                         int requestId,
                         bool isLast) override {
+        // 不过滤请求号，也不隐藏迟到回调，便于把柜台实际返回完整展示出来。
         const int errorId = info == nullptr ? 0 : info->ErrorID;
         const char* errorMessage = info == nullptr ? "" : info->ErrorMsg;
 
@@ -158,6 +162,7 @@ public:
     }
 
     bool wait() {
+        // 主线程最多等待 60 秒；回调线程通过 finish() 唤醒它。
         std::unique_lock<std::mutex> lock(mutex_);
         if (!condition_.wait_for(lock, kTimeout, [this] { return done_; })) {
             log("RESULT FAIL timeout: no final login/error callback within 60 seconds");
@@ -208,6 +213,7 @@ int main() {
     }
 
     MdSpi spi(*api, password);
+    // 生命周期顺序：注册回调 -> 注册前置 -> Init -> 等响应 -> 解绑并释放。
     api->RegisterSpi(&spi);
     char front[] = "tcp://101.226.254.157:32213";
     api->RegisterFront(front);
