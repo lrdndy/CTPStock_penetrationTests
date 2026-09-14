@@ -1,0 +1,7 @@
+# Copy this file to connection.local.ini in the same directory, then fill in
+# both values once. run_windows.bat and the EXE load it automatically.
+# The real connection.local.ini is ignored by Git and excluded from releases.
+# UTF-8 text; values are literal (no quotes or inline comments).
+[credentials]
+password=
+auth_code=

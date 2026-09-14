@@ -1,6 +1,6 @@
 # 股票期权 API 连接测试第一阶段
 
-本项目是为附件六股票期权接入测试准备的第一步：在 Windows 64 位实体机上验证交易前置连接、客户端认证、账户登录、资金查询，以及行情前置连接和登录。源码版本为 `0.1.0`。本包包含源码和原始 Windows SDK 依赖，需要在 Windows 上编译生成 EXE。
+本项目是为附件六股票期权接入测试准备的第一步：在 Windows 64 位实体机上验证交易前置连接、客户端认证、账户登录、资金查询，以及行情前置连接和登录。源码版本为 `0.1.1`。本包包含源码和原始 Windows SDK 依赖，需要在 Windows 上编译生成 EXE。
 
 本阶段没有报单、撤单、密码修改、结算确认、策略或风控交易功能，也不订阅行情。行情登录成功只能证明行情登录链路；要证明行情推送，需要下一阶段指定有效合约并收到行情回调。附件六后续范围见 [REPORT_ROADMAP.md](docs/REPORT_ROADMAP.md)。
 
@@ -15,12 +15,19 @@
 ```powershell
 cd D:\projects\CTPStockConnectivity
 .\build_windows.bat
+Copy-Item config\connection.local.ini.example config\connection.local.ini
+notepad config\connection.local.ini
+```
+
+在记事本中填入自己的交易密码和认证码，保存后关闭。复制模板和填写只需做一次，后续更新代码时保留这个本地文件；已有 `connection.local.ini` 时不要再次复制覆盖。随后执行：
+
+```powershell
 .\run_windows.bat --mode all
 ```
 
 `build_windows.bat` 自动寻找 Visual Studio 并调用 x64 编译器，不依赖 CMake。成功后生成 `build\bin\ctp_stock_connect.exe`，同时复制两只 DLL。源码中包含中文注释，编译采用 UTF-8 头文件副本。
 
-程序会要求输入交易密码和 AuthCode。输入时不显示字符，这是正常现象。使用本次账号对应的密码和邮件中箭头右侧的认证码；不要把箭头或 APPID 一起输入。当前包不保存这两项。日志保留完整账号以便登录截图核验，所以向他人发送日志前仍需检查内容。
+填好本地配置后，程序自动读取交易密码和 AuthCode，每次运行不再要求输入。认证码使用邮件中箭头右侧的值，不包含箭头或 APPID。只有必需凭据既未配置、也未通过环境变量提供时，程序才会隐藏输入提示；输入时不显示字符属于正常现象。日志保留完整账号以便登录截图核验，所以向他人发送日志前仍需检查内容。
 
 如果找不到编译器，用 Visual Studio 的 **x64 Native Tools Command Prompt** 再执行 `build_windows.bat`。若报缺 Windows SDK 或 C++ 工具，则在 Visual Studio Installer 中补齐组件。
 
@@ -37,7 +44,21 @@ cd D:\projects\CTPStockConnectivity
 | trader_front | tcp://101.226.254.157:32205 | 交易评测前置 |
 | md_front | tcp://101.226.254.157:32213 | 行情评测前置 |
 
-AppID 中的 `v1.0.0` 是已申请的标识组成部分，不能因为样例源码版本是 `0.1.0` 就随意修改。投资者代码若与登录账号不同，应按中信提供的值修改 `investor_id`。第一阶段程序只允许上述评测前置和 BrokerID，不支持将配置直接切到生产环境。
+AppID 中的 `v1.0.0` 是已申请的标识组成部分，不能因为样例源码版本是 `0.1.1` 就随意修改。投资者代码若与登录账号不同，应按中信提供的值修改 `investor_id`。第一阶段程序只允许上述评测前置和 BrokerID，不支持将配置直接切到生产环境。
+
+`config/connection.local.ini` 用来保存本机凭据，内容如下（将占位文字换成真实值）：
+
+```ini
+[credentials]
+password=填写交易密码
+auth_code=填写认证码
+```
+
+这个仓库为公开仓库，只提交空凭据模板；真实本地文件已被 `.gitignore` 的 `*.local.ini` 规则排除。文件内容以明文保存在你的电脑，不会由本程序打印到日志。请用 UTF-8 保存，不要给值加引号或在值后面追加注释：`#`、`;`、`=` 在值中按原字符读取，值两端的空白会被去掉。
+
+程序先读取选中的配置文件（默认 `config/connection.ini`），再自动叠加同目录的 `connection.local.ini`，不需要额外传命令行参数。使用 `--config config\other.ini` 时，自动查找的是 `config/other.local.ini`；若直接指定一个 `*.local.ini` 文件，就只读取该文件，不再继续查找另一层本地配置。
+
+`password` 和 `auth_code` 也可以直接写在选中的主 INI 中，既支持 `[credentials]` 小节，也支持不写小节的平铺格式。对于每一项凭据，按以下顺序取第一个非空值：**同名本地配置 → 选中的主 INI → `CTP_PASSWORD` / `CTP_AUTH_CODE` 环境变量 → 隐藏输入**。空值不覆盖已有值。`--mode md` 只需要密码，不需要 AuthCode。
 
 ```powershell
 # 分别排查交易与行情
@@ -57,7 +78,7 @@ AppID 中的 `v1.0.0` 是已申请的标识组成部分，不能因为样例源�
 
 默认每一步等待 30 秒，整个程序可能经历多个步骤，因此总用时不等于 30 秒。程序不会在失败后自动重试认证或登录。`all` 顺序运行交易和行情链路，具体执行与返回状态以日志为准。
 
-也支持从进程环境变量 `CTP_PASSWORD`、`CTP_AUTH_CODE` 读取凭据，以便后续自动化。初次调试推荐交互输入；不要把包含密码的命令写入共享脚本、PowerShell 历史、截图或录屏。环境变量不是加密保险箱，使用完毕应清除。
+配置文件中的凭据优先于进程环境变量。需要改密码或认证码时，编辑 `config/connection.local.ini` 并重新运行即可；修改配置本身不需要重新编译。升级到本版本的源码后仍需先重新编译一次。本次新增凭据配置功能的验证范围为离线解析和流程检查，维护端未执行 Windows 实机编译或真实柜台登录。
 
 ## 怎么判断结果
 
@@ -107,7 +128,7 @@ Windows 编译成功后，可以制作此阶段运行包：
 .\scripts\package_release.ps1
 ```
 
-脚本在 `dist` 下创建带时间的独立运行包和对应 MD5/SHA256 文本，不收录 `logs`、`flow` 或环境变量。运行包保留 `build\bin` 布局，解压后从根目录执行 `run_windows.bat`。这只是第一阶段的运行快照；该脚本不负责病毒检测，也不证明其满足全部评测要求。
+脚本在 `dist` 下创建带时间的独立运行包和对应 MD5/SHA256 文本，不收录 `logs`、`flow`、环境变量或真实 `*.local.ini`。打包时从复制到运行包的主配置中去掉 `password` 和 `auth_code` 字段，原文件不变，并保留空的 `connection.local.ini.example` 模板。运行包保留 `build\bin` 布局；在另一台电脑解压后，先按上文复制模板、填写本地凭据一次，再从根目录执行 `run_windows.bat`。这只是第一阶段的运行快照；该脚本不负责病毒检测，也不证明其满足全部评测要求。
 
 最终附件六的 MD5 必须针对最终提交的那一份 ZIP 或安装包。备份应保留同一文件；软件或包内容改变后须重新打包、重算 MD5，不能沿用本次源码包的值。建议同步保留 SHA256。
 
@@ -117,6 +138,8 @@ Windows 编译成功后，可以制作此阶段运行包：
 | --- | --- |
 | src/main.cpp | 核心连接程序与中文注释 |
 | config/connection.ini | 账号标识、APPID 和评测地址 |
+| config/connection.local.ini.example | 本机密码和 AuthCode 的空模板，首次复制后填写 |
+| config/connection.local.ini | 本机填写的凭据，不提交到 Git，也不放入运行包 |
 | sdk/win64 | 用户附件的原始 Windows 64 位 SDK |
 | sdk/include | 编译使用的 UTF-8 头文件副本，声明不变 |
 | build_windows.bat | 自动查找 Visual Studio 并编译 |

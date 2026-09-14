@@ -19,11 +19,13 @@ foreach ($ctpName in $ctpRequired) {
     Copy-Item -LiteralPath (Join-Path $ctpBin $ctpName) -Destination (Join-Path $ctpStage 'build\bin')
 }
 $ctpConfig = Join-Path $ctpRoot 'config\connection.ini'
-if (Select-String -LiteralPath $ctpConfig -Pattern '^\s*(password|auth_code|authcode)\s*=' -Quiet) {
-    throw 'Remove secrets from connection.ini before packaging.'
-}
 New-Item -ItemType Directory -Path (Join-Path $ctpStage 'config') | Out-Null
-Copy-Item -LiteralPath $ctpConfig -Destination (Join-Path $ctpStage 'config\connection.ini')
+# Strip credential entries even if the operator filled the main config.
+# Only the empty local-config example is copied; never include *.local.ini.
+Get-Content -LiteralPath $ctpConfig -Encoding UTF8 |
+    Where-Object { $_ -notmatch '^\s*(password|auth_code|authcode)\s*=' } |
+    Set-Content -LiteralPath (Join-Path $ctpStage 'config\connection.ini') -Encoding UTF8
+Copy-Item -LiteralPath (Join-Path $ctpRoot 'config\connection.local.ini.example') -Destination (Join-Path $ctpStage 'config')
 Copy-Item -LiteralPath (Join-Path $ctpRoot 'docs') -Destination $ctpStage -Recurse
 Copy-Item -LiteralPath (Join-Path $ctpRoot 'run_windows.bat') -Destination $ctpStage
 $ctpRuntimeReadme = @'
@@ -37,7 +39,12 @@ change to this package directory, then run:
 
     .\run_windows.bat --mode all
 
-Enter the account password and authentication code at the hidden prompts.
+For one-time setup, copy config/connection.local.ini.example to
+config/connection.local.ini and fill password= and auth_code= there.
+Future runs load those values automatically without prompting.
+The runtime package never includes credentials from the packaging machine.
+Without configured values, CTP_PASSWORD / CTP_AUTH_CODE and hidden prompts
+remain available as fallbacks. MD-only mode needs no AuthCode.
 The config/connection.ini contains account identifiers and evaluation fronts.
 Read docs/CODE_GUIDE.md and docs/REPORT_ROADMAP.md for scope and next steps.
 No orders, cancels, password changes or settlement confirmations are sent.
