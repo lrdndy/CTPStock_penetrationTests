@@ -6,8 +6,6 @@
 
 当前交付不是已通过的正式测试报告。实际柜台登录结果、Windows 编译与运行结果，以你的实体机执行结果为准；没有预先生成或冒充成功的截图和录屏。代码说明见 [CODE_GUIDE.md](docs/CODE_GUIDE.md)，离线验证范围见 [VALIDATION.md](docs/VALIDATION.md)。
 
-若只想排除主程序的配置和状态机影响，可使用 [minimal_md_test](minimal_md_test/README.md)。它是一份独立的单文件行情登录对照程序，只连接、提交一次登录并原样打印 SDK 回调。
-
 ## 最快运行方式
 
 1. 将工程解压到例如 `D:\projects\CTPStockConnectivity`。建议初次使用短的英文路径。
