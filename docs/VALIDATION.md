@@ -1,4 +1,14 @@
-# 第一阶段交付验证记录
+# 交付验证记录
+
+## v0.2.0：1.1 基础功能测试
+
+- 新增 `--test basic` 的 `single-shot-limit` 单次策略：使用明确的合约、交易所、方向、开平和限价生成一笔 `VolumeTotalOriginal=1` 的 GFD 限价单。
+- 默认是 dry-run；只有同时提供 `--send-order --confirm SEND_ONE_ORDER` 才调用 `ReqOrderInsert`。程序没有数量参数、自动重试或追价。
+- 实发模式按本次 `OrderRef` 处理 `OnRspOrderInsert`、`OnErrRtnOrderInsert`、`OnRtnOrder`、`OnRtnTrade`、`OnRspOrderAction` 和 `OnErrRtnOrderAction`；排队后自动申请撤单。完全成交不会被写成撤单通过。
+- 新增 5 项离线回归，覆盖默认不实发及确认令牌、报单字段、排队后程序撤单、完全成交不得冒充撤单通过，以及撤单调用返回前并发回调不能掩盖即时提交失败；连同原有测试共 27 项通过，POSIX 隐藏输入检查通过。
+- 同一组 27 项离线回归通过 AddressSanitizer 与 UndefinedBehaviorSanitizer；当前容器按既有方式关闭 LeakSanitizer，不能据此宣称已证明无内存泄漏。
+- `src/main.cpp` 使用实际 3.7.5 头文件通过 C++17 语法检查，并与附件中 Linux x86-64 的两只 3.7.5 原厂 `.so` 完成链接；离线运行 `--version` / `--help` 显示匹配版本且未建立连接。当前环境没有 Windows/MSVC，未执行 Windows 原生链接，也未向柜台发送订单。
+- 正式基础功能结论仍待用户在指定 Windows 实体机上，使用券商确认的当日有效 SSE/SZSE 测试合约和价格分别运行；dry-run 不能作为柜台报单或撤单证据。
 
 ## v0.1.3：兼容行情登录回调请求编号 0
 
@@ -8,7 +18,7 @@
 - SPI 在状态过滤前写入原始回调名、实际请求编号、`bIsLast` 和响应错误；`Logger` 增加互斥保护，以支持 SDK 回调线程与主线程安全写日志。
 - 新增三项回归：MD 登录接受编号 0、MD 错误响应接受编号 0、严格策略拒绝编号 0 并保留正确编号的响应。
 - `python3 tests/run_config_tests.py` 共 22 项离线回归和 1 项 POSIX 隐藏输入检查通过；`src/main.cpp` 使用实际 3.7.5 头文件通过 C++17 语法检查。
-- 尚未在修改后的 v0.1.3 主程序上执行 Windows 原生构建和真实柜台复测；需重新编译后确认 MD 阶段由原超时变为成功。
+- 用户已在 Windows x64 实体机重新构建 v0.1.3，并于 2026-09-14 13:25:42 连接当前 MD 前置实测通过：`ReqUserLogin(..., 1)` 的成功回调编号仍为 `0`，程序记录兼容原因并最终输出 `overall=PASS md=PASS`。
 
 ## v0.1.2：个股期权 SDK 升级到 3.7.5
 

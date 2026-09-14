@@ -53,6 +53,13 @@ void test(const char* name, const std::function<void()>& body) {
         throw;
     }
 }
+Options parse(std::initializer_list<const char*> arguments) {
+    std::vector<std::string> values{"ctp_test"};
+    for (const char* argument : arguments) values.emplace_back(argument);
+    std::vector<char*> pointers;
+    for (auto& value : values) pointers.push_back(value.data());
+    return parseOptions(static_cast<int>(pointers.size()), pointers.data());
+}
 }
 
 int main(int argc, char** argv) {
@@ -155,7 +162,7 @@ int main(int argc, char** argv) {
             const auto path = configFile("front", "");
             writeFile(path.parent_path() / "connection.local.ini", "trader_front=tcp://127.0.0.1:1\n");
             Secrets secret;
-            rejects([&] { readConfig(path.string(), secret); }, "Phase 1 permits only");
+            rejects([&] { readConfig(path.string(), secret); }, "permits only");
         });
         test("configured value beats environment with no prompt", [] {
             setTestEnv("EnvironmentDummy42");
@@ -241,6 +248,87 @@ int main(int argc, char** argv) {
             require(!result.ok && result.hasInfo && result.info.ErrorID == 77,
                     "MD zero-ID error response was not retained");
             require(result.acceptedZeroRequestId, "MD zero-ID error compatibility was not recorded");
+        });
+        test("basic test is dry-run unless send flag and confirmation are both present", [] {
+            const auto dry = parse({"--mode", "trader", "--test", "basic", "--instrument", "DUMMY_OPT",
+                                    "--exchange", "SSE", "--direction", "buy", "--offset", "open",
+                                    "--price", "0.0123"});
+            require(!dry.sendOrder, "Basic test unexpectedly enabled live transmission");
+            rejects([] {
+                (void)parse({"--mode", "trader", "--test", "basic", "--instrument", "DUMMY_OPT",
+                             "--exchange", "SSE", "--direction", "buy", "--offset", "open",
+                             "--price", "0.0123", "--send-order"});
+            }, "requires --confirm");
+            const auto live = parse({"--mode", "trader", "--test", "basic", "--instrument", "DUMMY_OPT",
+                                     "--exchange", "SZSE", "--direction", "sell", "--offset", "close",
+                                     "--price", "0.0123", "--send-order", "--confirm", "SEND_ONE_ORDER"});
+            require(live.sendOrder, "Explicitly confirmed live test was not enabled");
+        });
+        test("basic strategy constructs volume-one GFD speculative limit order", [] {
+            Config config;
+            config.investor = config.user;
+            Options options;
+            options.test = "basic"; options.instrument = "DUMMY_OPT"; options.exchange = "SSE";
+            options.direction = "buy"; options.offset = "open"; options.price = 0.0123;
+            const auto order = basicOrderRequest(config, options, "7");
+            require(textField(order.InstrumentID) == "DUMMY_OPT" && textField(order.ExchangeID) == "SSE",
+                    "Basic strategy lost instrument or exchange");
+            require(textField(order.OrderRef) == "7" && order.OrderPriceType == THOST_FTDC_OPT_LimitPrice,
+                    "Basic strategy lost order reference or limit type");
+            require(order.Direction == THOST_FTDC_D_Buy && order.CombOffsetFlag[0] == THOST_FTDC_OF_Open,
+                    "Basic strategy direction or offset changed");
+            require(order.CombHedgeFlag[0] == THOST_FTDC_HF_Speculation && order.VolumeTotalOriginal == 1,
+                    "Basic strategy hedge flag or volume-one cap changed");
+            require(order.TimeCondition == THOST_FTDC_TC_GFD && order.VolumeCondition == THOST_FTDC_VC_AV &&
+                    order.MinVolume == 1 && order.ContingentCondition == THOST_FTDC_CC_Immediately,
+                    "Basic strategy execution conditions changed");
+        });
+        test("order lifecycle waits for queueing then verifies program cancellation", [] {
+            OrderLifecycle lifecycle;
+            lifecycle.start("8");
+            CThostFtdcOrderField order{};
+            field(order.OrderRef, "8", "order_ref");
+            field(order.InstrumentID, "DUMMY_OPT", "instrument");
+            field(order.ExchangeID, "SSE", "exchange");
+            order.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+            order.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+            lifecycle.returnedOrder(&order);
+            const auto queued = lifecycle.waitUntilCancelableOrDone(1);
+            require(queued.readyToCancel && !queued.done, "Queued order was not made cancelable");
+            require(lifecycle.beginCancellation(), "Cancelable order changed before cancellation");
+            lifecycle.cancellationSubmitted(0);
+            order.OrderStatus = THOST_FTDC_OST_Canceled;
+            lifecycle.returnedOrder(&order);
+            const auto canceled = lifecycle.waitUntilDone(1);
+            require(canceled.ok && canceled.cancelAttempted, "Program cancellation was not verified");
+        });
+        test("fully traded order cannot claim cancellation passed", [] {
+            OrderLifecycle lifecycle;
+            lifecycle.start("9");
+            CThostFtdcOrderField order{};
+            field(order.OrderRef, "9", "order_ref");
+            order.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+            order.OrderStatus = THOST_FTDC_OST_AllTraded;
+            lifecycle.returnedOrder(&order);
+            const auto result = lifecycle.waitUntilCancelableOrDone(1);
+            require(result.done && !result.ok && !result.cancelAttempted,
+                    "Fully traded order incorrectly passed cancellation");
+        });
+        test("canceled callback during rejected cancel call cannot pass", [] {
+            OrderLifecycle lifecycle;
+            lifecycle.start("10");
+            CThostFtdcOrderField order{};
+            field(order.OrderRef, "10", "order_ref");
+            order.OrderSubmitStatus = THOST_FTDC_OSS_Accepted;
+            order.OrderStatus = THOST_FTDC_OST_NoTradeQueueing;
+            lifecycle.returnedOrder(&order);
+            require(lifecycle.waitUntilCancelableOrDone(1).readyToCancel, "Order did not queue");
+            require(lifecycle.beginCancellation(), "Cancellation could not begin");
+            order.OrderStatus = THOST_FTDC_OST_Canceled; // 模拟 SDK 在 ReqOrderAction 返回前同步派发回调。
+            lifecycle.returnedOrder(&order);
+            lifecycle.cancellationSubmitted(-2);
+            const auto result = lifecycle.waitUntilDone(1);
+            require(result.done && !result.ok, "Rejected cancellation incorrectly passed after early callback");
         });
         setTestEnv("");
         std::cout << passed << " offline regression tests passed; no SDK connection was attempted.\n";

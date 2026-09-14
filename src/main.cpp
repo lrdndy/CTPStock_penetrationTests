@@ -1,9 +1,10 @@
-// 第一阶段：只验证个股期权评测 API 的连接、认证、登录和只读资金查询。
+// 个股期权评测 API 的连接测试，以及受显式开关保护的单次限价报单/撤单基础功能测试。
 // SDK 的对象/类型在 ctp_sopt 命名空间，不能混用期货版 CTP 头文件或 DLL。
 #include "ThostFtdcTraderApi.h"
 #include "ThostFtdcMdApi.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -33,7 +34,7 @@
 using namespace ctp_sopt;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock; // 超时用单调时钟，避免系统校时影响等待时间。
-constexpr const char* kVersion = "v0.1.3";
+constexpr const char* kVersion = "v0.2.0";
 constexpr const char* kTraderFront = "tcp://101.226.254.157:32205";
 constexpr const char* kMdFront = "tcp://101.226.254.157:32213";
 
@@ -44,8 +45,10 @@ struct Config {
 };
 struct Options {
     std::string mode = "all", config = "config/connection.ini";
+    std::string test = "connectivity", instrument, exchange, direction, offset, confirmation;
+    double price = 0.0;
     int timeout = 30;
-    bool skipQuery = false, help = false, version = false;
+    bool skipQuery = false, sendOrder = false, help = false, version = false;
 };
 
 void eraseSecret(std::string& s) {
@@ -70,21 +73,59 @@ Options parseOptions(int argc, char** argv) {
         if (arg == "--help" || arg == "-h") { o.help = true; continue; }
         if (arg == "--version") { o.version = true; continue; }
         if (arg == "--skip-query") { o.skipQuery = true; continue; }
-        if (arg != "--mode" && arg != "--config" && arg != "--timeout")
+        if (arg == "--send-order") { o.sendOrder = true; continue; }
+        if (arg != "--mode" && arg != "--config" && arg != "--timeout" && arg != "--test" &&
+            arg != "--instrument" && arg != "--exchange" && arg != "--direction" &&
+            arg != "--offset" && arg != "--price" && arg != "--confirm")
             throw std::runtime_error("Unknown option; use --help.");
         if (++i == argc) throw std::runtime_error("Missing option value; use --help.");
         std::string value = argv[i];
         if (arg == "--mode") o.mode = value;
         else if (arg == "--config") o.config = value;
-        else {
+        else if (arg == "--timeout") {
             if (value.empty() || value.size() > 3 || value.find_first_not_of("0123456789") != std::string::npos)
                 throw std::runtime_error("--timeout must be 1..300 seconds.");
             o.timeout = std::stoi(value);
             if (o.timeout < 1 || o.timeout > 300) throw std::runtime_error("--timeout must be 1..300 seconds.");
+        } else if (arg == "--test") o.test = value;
+        else if (arg == "--instrument") o.instrument = value;
+        else if (arg == "--exchange") o.exchange = value;
+        else if (arg == "--direction") o.direction = value;
+        else if (arg == "--offset") o.offset = value;
+        else if (arg == "--confirm") o.confirmation = value;
+        else if (arg == "--price") {
+            std::size_t used = 0;
+            try { o.price = std::stod(value, &used); }
+            catch (...) { throw std::runtime_error("--price must be a positive finite number."); }
+            if (used != value.size() || !std::isfinite(o.price) || o.price <= 0.0)
+                throw std::runtime_error("--price must be a positive finite number.");
         }
     }
     if (o.mode != "all" && o.mode != "trader" && o.mode != "md")
         throw std::runtime_error("--mode must be trader, md, or all.");
+    if (o.test != "connectivity" && o.test != "basic")
+        throw std::runtime_error("--test must be connectivity or basic.");
+    if (o.test == "connectivity") {
+        if (o.sendOrder || !o.instrument.empty() || !o.exchange.empty() || !o.direction.empty() ||
+            !o.offset.empty() || o.price != 0.0 || !o.confirmation.empty())
+            throw std::runtime_error("Order options require --test basic.");
+    } else {
+        if (o.mode != "trader") throw std::runtime_error("--test basic requires --mode trader.");
+        if (o.instrument.empty() || o.exchange.empty() || o.direction.empty() || o.offset.empty() || o.price <= 0.0)
+            throw std::runtime_error("--test basic requires --instrument, --exchange, --direction, --offset, and --price.");
+        if (o.exchange != "SSE" && o.exchange != "SZSE")
+            throw std::runtime_error("--exchange must be SSE or SZSE.");
+        if (o.direction != "buy" && o.direction != "sell")
+            throw std::runtime_error("--direction must be buy or sell.");
+        if (o.offset != "open" && o.offset != "close")
+            throw std::runtime_error("--offset must be open or close.");
+        if (o.sendOrder && o.confirmation != "SEND_ONE_ORDER")
+            throw std::runtime_error("Live transmission requires --confirm SEND_ONE_ORDER.");
+        if (!o.sendOrder && !o.confirmation.empty())
+            throw std::runtime_error("--confirm is valid only with --send-order.");
+        if (o.sendOrder && o.skipQuery)
+            throw std::runtime_error("Live basic test does not allow --skip-query.");
+    }
     return o;
 }
 void readConfigFile(const fs::path& path, Config& c, Secrets& secret) {
@@ -131,9 +172,9 @@ Config readConfig(const std::string& path, Secrets& secret) {
         if (fs::exists(local)) readConfigFile(local, c, secret);
     }
     if (c.investor.empty()) c.investor = c.user;
-    // 第一阶段固定评测前置和 BrokerID，防止配置误指向其他环境。
+    // 本项目固定评测前置和 BrokerID，防止配置误指向生产或其他环境。
     if (c.broker != "1000" || c.trader != kTraderFront || c.md != kMdFront)
-        throw std::runtime_error("Phase 1 permits only BrokerID 1000 and the supplied evaluation fronts.");
+        throw std::runtime_error("This project permits only BrokerID 1000 and the supplied evaluation fronts.");
     return c;
 }
 
@@ -146,6 +187,52 @@ template <std::size_t N> void field(char (&out)[N], const std::string& in, const
 }
 template <std::size_t N> std::string textField(const char (&value)[N]) {
     return std::string(value, std::find(value, value + N, '\0'));
+}
+std::string nextOrderRef(const CThostFtdcRspUserLoginField& login) {
+    const std::string current = trim(textField(login.MaxOrderRef));
+    unsigned long long value = 0;
+    if (!current.empty()) {
+        if (current.find_first_not_of("0123456789") != std::string::npos)
+            throw std::runtime_error("Login MaxOrderRef is not numeric; live order test stopped.");
+        try { value = std::stoull(current); }
+        catch (...) { throw std::runtime_error("Login MaxOrderRef is invalid; live order test stopped."); }
+    }
+    if (value >= 999999999999ULL)
+        throw std::runtime_error("Login MaxOrderRef has no safe room for the next order reference.");
+    return std::to_string(value + 1);
+}
+CThostFtdcInputOrderField basicOrderRequest(const Config& c, const Options& o, const std::string& orderRef) {
+    CThostFtdcInputOrderField request{};
+    field(request.BrokerID, c.broker, "broker_id");
+    field(request.InvestorID, c.investor, "investor_id");
+    field(request.UserID, c.user, "user_id");
+    field(request.InstrumentID, o.instrument, "instrument");
+    field(request.ExchangeID, o.exchange, "exchange");
+    field(request.OrderRef, orderRef, "order_ref");
+    request.OrderPriceType = THOST_FTDC_OPT_LimitPrice;
+    request.Direction = o.direction == "buy" ? THOST_FTDC_D_Buy : THOST_FTDC_D_Sell;
+    request.CombOffsetFlag[0] = o.offset == "open" ? THOST_FTDC_OF_Open : THOST_FTDC_OF_Close;
+    request.CombHedgeFlag[0] = THOST_FTDC_HF_Speculation;
+    request.LimitPrice = o.price;
+    request.VolumeTotalOriginal = 1; // 基础功能测试硬限制 API 报单数量为 1，不提供放大数量的参数。
+    request.TimeCondition = THOST_FTDC_TC_GFD;
+    request.VolumeCondition = THOST_FTDC_VC_AV;
+    request.MinVolume = 1;
+    request.ContingentCondition = THOST_FTDC_CC_Immediately;
+    request.ForceCloseReason = THOST_FTDC_FCC_NotForceClose;
+    request.IsAutoSuspend = 0;
+    request.RequestID = 4;
+    request.UserForceClose = 0;
+    request.IsSwapOrder = 0;
+    return request;
+}
+std::string orderPlanText(const Options& o, const std::string& orderRef) {
+    std::ostringstream line;
+    line << "strategy=single-shot-limit instrument=" << o.instrument
+         << " exchange=" << o.exchange << " direction=" << o.direction
+         << " offset=" << o.offset << " limit_price=" << std::fixed << std::setprecision(6) << o.price
+         << " volume=1 time_condition=GFD order_ref=" << orderRef;
+    return line.str();
 }
 std::string getSecret(const std::string& configured, const char* envName, const char* prompt) {
     if (!configured.empty()) return configured;
@@ -337,6 +424,153 @@ public:
     }
 };
 
+struct OrderResult {
+    bool readyToCancel = false, done = false, ok = false, cancelAttempted = false;
+    int tradedVolume = 0;
+    std::string reason;
+    CThostFtdcOrderField order{};
+};
+
+// 报单请求成功没有统一的“最终 OnRsp”语义；接受、成交和撤销主要由 OnRtnOrder/OnRtnTrade 驱动。
+// 因此基础功能测试单独维护订单生命周期，不复用上面的 Req.../bIsLast 阶段状态机。
+class OrderLifecycle {
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::string orderRef_;
+    bool readyToCancel_ = false, done_ = false, ok_ = false, cancelAttempted_ = false;
+    bool cancelResponseKnown_ = false, cancelSubmissionAccepted_ = false, canceledObserved_ = false;
+    int tradedVolume_ = 0;
+    std::string reason_;
+    CThostFtdcOrderField order_{};
+
+    template <std::size_t N> bool matches(const char (&value)[N]) const {
+        return trim(textField(value)) == orderRef_;
+    }
+    void fail(const std::string& reason) {
+        if (done_) return;
+        done_ = true; ok_ = false; reason_ = reason; cv_.notify_all();
+    }
+    OrderResult snapshot() const {
+        OrderResult result;
+        result.readyToCancel = readyToCancel_; result.done = done_; result.ok = ok_;
+        result.cancelAttempted = cancelAttempted_; result.tradedVolume = tradedVolume_;
+        result.reason = reason_; result.order = order_;
+        return result;
+    }
+public:
+    void start(std::string orderRef) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        orderRef_ = std::move(orderRef);
+        readyToCancel_ = done_ = ok_ = cancelAttempted_ = false;
+        cancelResponseKnown_ = cancelSubmissionAccepted_ = canceledObserved_ = false;
+        tradedVolume_ = 0; reason_.clear(); order_ = {};
+    }
+    const std::string& orderRef() const { return orderRef_; }
+
+    void insertResponse(CThostFtdcInputOrderField* input, CThostFtdcRspInfoField* info) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (input && !matches(input->OrderRef)) return;
+        if (info && info->ErrorID != 0) fail("OnRspOrderInsert rejected the order");
+    }
+    void insertError(CThostFtdcInputOrderField* input, CThostFtdcRspInfoField* info) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (input && !matches(input->OrderRef)) return;
+        fail(info && info->ErrorID != 0 ? "OnErrRtnOrderInsert rejected the order"
+                                        : "OnErrRtnOrderInsert without a nonzero error code");
+    }
+    void actionResponse(CThostFtdcInputOrderActionField* action, CThostFtdcRspInfoField* info) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (action && !matches(action->OrderRef)) return;
+        if (info && info->ErrorID != 0) fail("OnRspOrderAction rejected cancellation");
+    }
+    void actionError(CThostFtdcOrderActionField* action, CThostFtdcRspInfoField* info) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (action && !matches(action->OrderRef)) return;
+        fail(info && info->ErrorID != 0 ? "OnErrRtnOrderAction rejected cancellation"
+                                        : "OnErrRtnOrderAction without a nonzero error code");
+    }
+    void responseError(int request, CThostFtdcRspInfoField* info) {
+        if (request != 4 && request != 5) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (info && info->ErrorID != 0) fail("OnRspError for order request");
+    }
+    void insertSubmitted(int rc) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (rc != 0) fail("order submission rejected; immediate_rc=" + std::to_string(rc));
+    }
+    void returnedOrder(CThostFtdcOrderField* order) {
+        if (!order) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!matches(order->OrderRef) || done_) return;
+        order_ = *order;
+        tradedVolume_ = std::max(tradedVolume_, order->VolumeTraded);
+        if (order->OrderSubmitStatus == THOST_FTDC_OSS_InsertRejected) {
+            fail("order insert rejected by counter");
+        } else if (order->OrderStatus == THOST_FTDC_OST_Canceled) {
+            canceledObserved_ = true;
+            if (!cancelAttempted_) {
+                done_ = true; ok_ = false;
+                reason_ = "order canceled before this program submitted cancellation";
+            } else if (cancelResponseKnown_) {
+                done_ = true;
+                ok_ = cancelSubmissionAccepted_;
+                reason_ = ok_ ? "order accepted and remaining quantity canceled"
+                              : "order canceled but this program's cancellation submission was rejected";
+            }
+            cv_.notify_all();
+        } else if (order->OrderStatus == THOST_FTDC_OST_AllTraded) {
+            done_ = true; ok_ = false;
+            reason_ = "order fully traded before cancellation; financial effect occurred and cancel was not verified";
+            cv_.notify_all();
+        } else if (order->OrderStatus == THOST_FTDC_OST_PartTradedNotQueueing ||
+                   order->OrderStatus == THOST_FTDC_OST_NoTradeNotQueueing) {
+            fail("order is no longer queued and was not canceled by this program");
+        } else if (order->OrderStatus == THOST_FTDC_OST_PartTradedQueueing ||
+                   order->OrderStatus == THOST_FTDC_OST_NoTradeQueueing) {
+            readyToCancel_ = true;
+            cv_.notify_all();
+        }
+    }
+    void returnedTrade(CThostFtdcTradeField* trade) {
+        if (!trade) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (matches(trade->OrderRef)) tradedVolume_ += trade->Volume;
+    }
+    OrderResult waitUntilCancelableOrDone(int timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!cv_.wait_for(lock, std::chrono::seconds(timeout), [this] { return readyToCancel_ || done_; }))
+            fail("order status timeout before a cancelable or terminal callback");
+        return snapshot();
+    }
+    bool beginCancellation() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (done_ || !readyToCancel_) return false;
+        cancelAttempted_ = true;
+        return true;
+    }
+    OrderResult current() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return snapshot();
+    }
+    void cancellationSubmitted(int rc) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cancelResponseKnown_ = true;
+        cancelSubmissionAccepted_ = rc == 0;
+        if (rc != 0) {
+            fail("cancellation submission rejected; immediate_rc=" + std::to_string(rc));
+        } else if (canceledObserved_ && !done_) {
+            done_ = true; ok_ = true; reason_ = "order accepted and remaining quantity canceled";
+            cv_.notify_all();
+        }
+    }
+    OrderResult waitUntilDone(int timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!cv_.wait_for(lock, std::chrono::seconds(timeout), [this] { return done_; }))
+            fail("cancellation result timeout; check the live order at the counter immediately");
+        return snapshot();
+    }
+};
+
 void logCallback(Logger& log, const char* channel, const char* name,
                  int request, bool last, CThostFtdcRspInfoField* info) {
     std::string message = std::string(channel) + " CALLBACK " + name +
@@ -354,8 +588,10 @@ void logCallback(Logger& log, const char* channel, const char* name,
 class TraderSpi final : public CThostFtdcTraderSpi {
     State& state_;
     Logger& log_;
+    OrderLifecycle* order_;
 public:
-    TraderSpi(State& state, Logger& log) : state_(state), log_(log) {}
+    TraderSpi(State& state, Logger& log, OrderLifecycle* order = nullptr)
+        : state_(state), log_(log), order_(order) {}
     void OnFrontConnected() override { log_.write("TRADER CALLBACK OnFrontConnected"); state_.connected(); }
     void OnFrontDisconnected(int reason) override {
         log_.write("TRADER CALLBACK OnFrontDisconnected reason=" + std::to_string(reason));
@@ -376,9 +612,56 @@ public:
         logCallback(log_, "TRADER", "OnRspQryTradingAccount", id, last, e);
         state_.response(Stage::Account, p, e, id, last);
     }
+    void OnRspOrderInsert(CThostFtdcInputOrderField* p, CThostFtdcRspInfoField* e, int id, bool last) override {
+        logCallback(log_, "TRADER", "OnRspOrderInsert", id, last, e);
+        if (order_) order_->insertResponse(p, e);
+    }
+    void OnRspOrderAction(CThostFtdcInputOrderActionField* p, CThostFtdcRspInfoField* e, int id, bool last) override {
+        logCallback(log_, "TRADER", "OnRspOrderAction", id, last, e);
+        if (order_) order_->actionResponse(p, e);
+    }
+    void OnRtnOrder(CThostFtdcOrderField* p) override {
+        if (!p) { log_.write("TRADER CALLBACK OnRtnOrder payload=NULL"); return; }
+        std::ostringstream line;
+        line << "TRADER CALLBACK OnRtnOrder order_ref=" << textField(p->OrderRef)
+             << " instrument=" << textField(p->InstrumentID) << " exchange=" << textField(p->ExchangeID)
+             << " order_sys_id=" << textField(p->OrderSysID)
+             << " submit_status=" << p->OrderSubmitStatus << " order_status=" << p->OrderStatus
+             << " original_volume=" << p->VolumeTotalOriginal << " traded_volume=" << p->VolumeTraded
+             << " remaining_volume=" << p->VolumeTotal << " status_msg=" << textField(p->StatusMsg);
+        log_.write(line.str());
+        if (order_) order_->returnedOrder(p);
+    }
+    void OnRtnTrade(CThostFtdcTradeField* p) override {
+        if (!p) { log_.write("TRADER CALLBACK OnRtnTrade payload=NULL"); return; }
+        std::ostringstream line;
+        line << "TRADER CALLBACK OnRtnTrade order_ref=" << textField(p->OrderRef)
+             << " instrument=" << textField(p->InstrumentID) << " exchange=" << textField(p->ExchangeID)
+             << " order_sys_id=" << textField(p->OrderSysID) << " trade_id=" << textField(p->TradeID)
+             << " price=" << std::fixed << std::setprecision(6) << p->Price << " volume=" << p->Volume;
+        log_.write(line.str());
+        if (order_) order_->returnedTrade(p);
+    }
+    void OnErrRtnOrderInsert(CThostFtdcInputOrderField* p, CThostFtdcRspInfoField* e) override {
+        std::string line = "TRADER CALLBACK OnErrRtnOrderInsert order_ref=" +
+            (p ? textField(p->OrderRef) : std::string("NULL"));
+        if (e) line += " ErrorID=" + std::to_string(e->ErrorID) + " ErrorMsg=" + sdkMessage(*e);
+        else line += " RspInfo=NULL";
+        log_.write(line);
+        if (order_) order_->insertError(p, e);
+    }
+    void OnErrRtnOrderAction(CThostFtdcOrderActionField* p, CThostFtdcRspInfoField* e) override {
+        std::string line = "TRADER CALLBACK OnErrRtnOrderAction order_ref=" +
+            (p ? textField(p->OrderRef) : std::string("NULL"));
+        if (e) line += " ErrorID=" + std::to_string(e->ErrorID) + " ErrorMsg=" + sdkMessage(*e);
+        else line += " RspInfo=NULL";
+        log_.write(line);
+        if (order_) order_->actionError(p, e);
+    }
     void OnRspError(CThostFtdcRspInfoField* e, int id, bool last) override {
         logCallback(log_, "TRADER", "OnRspError", id, last, e);
         state_.error(e, id, last);
+        if (order_) order_->responseError(id, e);
     }
 };
 class MdSpi final : public CThostFtdcMdSpi {
@@ -436,7 +719,8 @@ bool report(Logger& log, const char* channel, Stage stage, int id, const Result&
     return r.ok;
 }
 template <typename Submit> bool runStage(State& state, Logger& log, const char* channel,
-                                        Stage stage, int id, int timeout, Submit submit) {
+                                        Stage stage, int id, int timeout, Submit submit,
+                                        Result* captured = nullptr) {
     log.write(std::string(channel) + " stage=" + stageName(stage) + " START request_id=" + std::to_string(id) +
               " timeout_seconds=" + std::to_string(timeout));
     if (state.begin(stage, id, timeout)) {
@@ -445,7 +729,9 @@ template <typename Submit> bool runStage(State& state, Logger& log, const char* 
         if (stage != Stage::Connect) log.write(std::string(channel) + " request_id=" + std::to_string(id) +
                                                " immediate_rc=" + std::to_string(rc) + " (submission only)");
     }
-    return report(log, channel, stage, id, state.wait());
+    const Result result = state.wait();
+    if (captured) *captured = result;
+    return report(log, channel, stage, id, result);
 }
 CThostFtdcReqUserLoginField loginRequest(const Config& c, const Secrets& s) {
     CThostFtdcReqUserLoginField request{};
@@ -454,9 +740,76 @@ CThostFtdcReqUserLoginField loginRequest(const Config& c, const Secrets& s) {
     // 此处不手填 IP/MAC，不伪造终端信息；SDK 实际采集和后台核验情况须在实体机登录后向券商确认。
     return request;
 }
+CThostFtdcInputOrderActionField basicCancelRequest(const Config& c, const Options& o,
+                                                    const CThostFtdcOrderField& order,
+                                                    const std::string& expectedOrderRef) {
+    CThostFtdcInputOrderActionField action{};
+    field(action.BrokerID, c.broker, "broker_id");
+    field(action.InvestorID, c.investor, "investor_id");
+    field(action.UserID, c.user, "user_id");
+    const std::string instrument = trim(textField(order.InstrumentID));
+    const std::string exchange = trim(textField(order.ExchangeID));
+    const std::string returnedOrderRef = trim(textField(order.OrderRef));
+    field(action.InstrumentID, instrument.empty() ? o.instrument : instrument, "instrument");
+    field(action.ExchangeID, exchange.empty() ? o.exchange : exchange, "exchange");
+    field(action.OrderRef, returnedOrderRef.empty() ? expectedOrderRef : returnedOrderRef, "order_ref");
+    const std::string orderSysId = textField(order.OrderSysID);
+    if (!orderSysId.empty()) field(action.OrderSysID, orderSysId, "order_sys_id");
+    action.FrontID = order.FrontID;
+    action.SessionID = order.SessionID;
+    action.OrderActionRef = 1;
+    action.RequestID = 5;
+    action.ActionFlag = THOST_FTDC_AF_Delete;
+    return action;
+}
+bool testBasicFunction(CThostFtdcTraderApi& api, const Config& c, const Options& o,
+                       const Result& login, OrderLifecycle& lifecycle, Logger& log) {
+    const std::string orderRef = nextOrderRef(login.login);
+    const auto order = basicOrderRequest(c, o, orderRef);
+    log.write("BASIC STRATEGY PLAN " + orderPlanText(o, orderRef));
+    if (!o.sendOrder) {
+        log.write("BASIC RESULT status=PASS strategy=PASS order_fields=PASS transmission=NOT_REQUESTED cancel=NOT_RUN");
+        log.write("BASIC NOTICE dry-run proves deterministic strategy/request construction only; it does not prove counter order acceptance");
+        return true;
+    }
+
+    lifecycle.start(orderRef);
+    log.write("BASIC LIVE_ORDER_START exactly_one_order=YES automatic_retry=NO automatic_reprice=NO");
+    auto request = order; // SDK 接口不是 const；缓冲在整个等待阶段保持有效。
+    const int insertRc = api.ReqOrderInsert(&request, 4);
+    log.write("BASIC CALL ReqOrderInsert request_id=4 immediate_rc=" + std::to_string(insertRc) +
+              " (submission only)");
+    lifecycle.insertSubmitted(insertRc);
+    const OrderResult accepted = lifecycle.waitUntilCancelableOrDone(o.timeout);
+    if (accepted.done) {
+        log.write("BASIC RESULT status=FAIL strategy=PASS order=NOT_CANCELABLE cancel=NOT_RUN traded_volume=" +
+                  std::to_string(accepted.tradedVolume) + " reason=" + accepted.reason);
+        return false;
+    }
+
+    auto action = basicCancelRequest(c, o, accepted.order, orderRef);
+    // 必须在调用 SDK 前原子确认订单仍可撤并设置标志，兼容排队后立刻成交和调用期间回调。
+    if (!lifecycle.beginCancellation()) {
+        const OrderResult changed = lifecycle.current();
+        log.write("BASIC RESULT status=FAIL strategy=PASS order=NOT_CANCELABLE cancel=NOT_RUN traded_volume=" +
+                  std::to_string(changed.tradedVolume) + " reason=" + changed.reason);
+        return false;
+    }
+    const int cancelRc = api.ReqOrderAction(&action, 5);
+    log.write("BASIC CALL ReqOrderAction request_id=5 immediate_rc=" + std::to_string(cancelRc) +
+              " order_ref=" + orderRef + " order_sys_id=" + textField(accepted.order.OrderSysID) +
+              " (submission only)");
+    lifecycle.cancellationSubmitted(cancelRc);
+    const OrderResult final = lifecycle.waitUntilDone(o.timeout);
+    log.write(std::string("BASIC RESULT status=") + (final.ok ? "PASS" : "FAIL") +
+              " strategy=PASS order=PASS cancel=" + (final.ok ? "PASS" : "FAIL") +
+              " traded_volume=" + std::to_string(final.tradedVolume) + " reason=" + final.reason);
+    return final.ok;
+}
 bool testTrader(const Config& c, const Secrets& s, const Options& o, const fs::path& flow, Logger& log) {
     State state;
-    TraderSpi spi(state, log);
+    OrderLifecycle orderLifecycle;
+    TraderSpi spi(state, log, o.test == "basic" ? &orderLifecycle : nullptr);
     const std::string flowPath = flow.generic_string() + "/";
     std::string front = c.trader;
     CThostFtdcReqAuthenticateField auth{};
@@ -469,16 +822,23 @@ bool testTrader(const Config& c, const Secrets& s, const Options& o, const fs::p
     std::unique_ptr<CThostFtdcTraderApi, ApiDeleter<CThostFtdcTraderApi>> api(CThostFtdcTraderApi::CreateFtdcTraderApi(flowPath.c_str()));
     if (!api) throw std::runtime_error("CreateFtdcTraderApi returned null.");
     api->RegisterSpi(&spi);
-    // QUICK 从登录后的新消息开始；不会重放历史私有/公共流。本例不处理报单、成交回报。
+    // QUICK 从登录后的新消息开始；不会重放历史私有/公共流。基础测试处理本次新报单/成交回报。
     api->SubscribePrivateTopic(THOST_TERT_QUICK); api->SubscribePublicTopic(THOST_TERT_QUICK);
     api->RegisterFront(front.data());
     if (!runStage(state, log, "TRADER", Stage::Connect, 0, o.timeout, [&] { api->Init(); return 0; })) return false;
     if (!runStage(state, log, "TRADER", Stage::Authenticate, 1, o.timeout, [&] { return api->ReqAuthenticate(&auth, 1); })) return false;
     log.write("TRADER LOGIN_START user=" + c.user + " broker=" + c.broker + " app_id=" + c.app);
-    if (!runStage(state, log, "TRADER", Stage::Login, 2, o.timeout, [&] { return api->ReqUserLogin(&login, 2); })) return false;
-    if (o.skipQuery) { log.write("TRADER account query SKIPPED (--skip-query)"); return true; }
-    // 不猜测账户币种/业务类型；其他筛选字段保持 SDK 零初始化值，读取该投资者返回的数据。
-    return runStage(state, log, "TRADER", Stage::Account, 3, o.timeout, [&] { return api->ReqQryTradingAccount(&query, 3); });
+    Result loginResult;
+    if (!runStage(state, log, "TRADER", Stage::Login, 2, o.timeout,
+                  [&] { return api->ReqUserLogin(&login, 2); }, &loginResult)) return false;
+    if (o.skipQuery) {
+        log.write("TRADER account query SKIPPED (--skip-query)");
+    } else {
+        // 不猜测账户币种/业务类型；其他筛选字段保持 SDK 零初始化值，读取该投资者返回的数据。
+        if (!runStage(state, log, "TRADER", Stage::Account, 3, o.timeout,
+                      [&] { return api->ReqQryTradingAccount(&query, 3); })) return false;
+    }
+    return o.test == "basic" ? testBasicFunction(*api, c, o, loginResult, orderLifecycle, log) : true;
 }
 bool testMd(const Config& c, const Secrets& s, const Options& o, const fs::path& flow, Logger& log) {
     State state;
@@ -522,10 +882,15 @@ int main(int argc, char** argv) {
         if (options.help) {
             std::cout << "Usage: ctp_stock_connect.exe [--mode all|trader|md] [--config FILE]\n"
                          "       [--timeout 1..300] [--skip-query] [--version] [--help]\n"
+                         "       --mode trader --test basic --instrument ID --exchange SSE|SZSE\n"
+                         "       --direction buy|sell --offset open|close --price PRICE\n"
+                         "       [--send-order --confirm SEND_ONE_ORDER]\n"
                          "Default: all, config/connection.ini, 30 seconds PER STAGE, account query enabled.\n"
                          "Credentials: nonempty local INI > main INI > CTP_PASSWORD / CTP_AUTH_CODE > hidden prompts.\n"
                          "config/connection.local.ini is loaded automatically when using the default config.\n"
-                         "MD-only mode does not need CTP_AUTH_CODE. No order or password-update operations.\n";
+                         "Basic test defaults to dry-run. --send-order transmits one GFD limit order with volume=1\n"
+                         "and attempts to cancel it; it may trade before cancellation. No automatic retry/reprice.\n"
+                         "MD-only mode does not need CTP_AUTH_CODE. No password-update operation.\n";
             return 0;
         }
         printVersions();
@@ -540,6 +905,7 @@ int main(int argc, char** argv) {
         if (options.mode != "md") field(check.AuthCode, secret.auth, "auth_code");
         CThostFtdcQryTradingAccountField qcheck{};
         field(qcheck.InvestorID, config.investor, "investor_id");
+        if (options.test == "basic") (void)basicOrderRequest(config, options, "1");
 #ifdef _WIN32
         const auto pid = GetCurrentProcessId();
 #else
@@ -557,21 +923,29 @@ int main(int argc, char** argv) {
         Logger log(logDir / "run.log", secret);
         log.write(std::string("PROGRAM version=") + kVersion + " sdk_package=traderAPI_3.7.5_CP_20251125");
         log.write(std::string("API trader=") + CThostFtdcTraderApi::GetApiVersion() + " md=" + CThostFtdcMdApi::GetApiVersion());
-        log.write("RUN id=" + runId + " mode=" + options.mode + " user=" + config.user + " broker=" + config.broker);
+        log.write("RUN id=" + runId + " mode=" + options.mode + " test=" + options.test +
+                  " user=" + config.user + " broker=" + config.broker);
         log.write("CONFIG app_id=" + config.app + " investor_id=" + config.investor);
         log.write("FRONTS trader=" + config.trader + " md=" + config.md);
         log.write("TIME timestamps=host_local_wall_clock; elapsed_timeouts=monotonic; check local clock before evidence capture");
         const std::string admin = administratorStatus();
         log.write("HOST administrator=" + admin + " physical_machine=NOT_VERIFIED (operator must confirm)");
         if (admin != "YES") log.write("NOTICE formal evaluation login requires an elevated Windows console on a physical machine");
-        log.write("SCOPE connect/auth/login/read-only-account-query; no market subscription, order, cancel, settlement or password change");
+        if (options.test == "basic") {
+            log.write(std::string("SCOPE connect/auth/login/read-only-account-query; single-shot limit strategy; ") +
+                      (options.sendOrder ? "exactly one order with volume=1 and cancellation enabled"
+                                         : "dry-run only; no order transmitted"));
+        } else {
+            log.write("SCOPE connect/auth/login/read-only-account-query; no market subscription, order, cancel, settlement or password change");
+        }
         bool traderOk = true, mdOk = true;
         if (options.mode != "md") traderOk = testTrader(config, secret, options, flowDir / "trader", log);
         // all 模式中行情是独立诊断项；交易失败后仍只执行一次行情连接和登录。
         if (options.mode != "trader") mdOk = testMd(config, secret, options, flowDir / "md", log);
         log.write(std::string("RESULT overall=") + (traderOk && mdOk ? "PASS" : "FAIL") +
                   " trader=" + (options.mode == "md" ? "NOT_RUN" : traderOk ? "PASS" : "FAIL") +
-                  " md=" + (options.mode == "trader" ? "NOT_RUN" : mdOk ? "PASS" : "FAIL"));
+                  " md=" + (options.mode == "trader" ? "NOT_RUN" : mdOk ? "PASS" : "FAIL") +
+                  " basic=" + (options.test != "basic" ? "NOT_RUN" : traderOk ? "PASS" : "FAIL"));
         log.write("EVIDENCE log=" + fs::absolute(logDir / "run.log").string());
         log.write("NEXT successful login should be reported to broker the same day; this program does not notify anyone");
         return traderOk && mdOk ? 0 : 1;

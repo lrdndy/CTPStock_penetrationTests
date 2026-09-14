@@ -28,16 +28,20 @@ Get-Content -LiteralPath $ctpConfig -Encoding UTF8 |
 Copy-Item -LiteralPath (Join-Path $ctpRoot 'config\connection.local.ini.example') -Destination (Join-Path $ctpStage 'config')
 Copy-Item -LiteralPath (Join-Path $ctpRoot 'docs') -Destination $ctpStage -Recurse
 Copy-Item -LiteralPath (Join-Path $ctpRoot 'run_windows.bat') -Destination $ctpStage
+Copy-Item -LiteralPath (Join-Path $ctpRoot 'run_basic_windows.bat') -Destination $ctpStage
 $ctpRuntimeReadme = @'
 # CTPStockConnectivity runtime snapshot
 
 This package contains the executable already built on the packaging machine.
-It is a phase-1 connectivity tool, not a completed evaluation submission.
+It is a connectivity and guarded basic-function test tool, not a completed evaluation submission.
 
 On the evaluation physical Windows PC, open an elevated PowerShell terminal,
 change to this package directory, then run:
 
     .\run_windows.bat --mode all
+
+For the guarded basic-function test, read docs/CODE_GUIDE.md and run
+run_basic_windows.bat with an instrument, exchange, direction, offset and price.
 
 For one-time setup, copy config/connection.local.ini.example to
 config/connection.local.ini and fill password= and auth_code= there.
@@ -47,7 +51,9 @@ Without configured values, CTP_PASSWORD / CTP_AUTH_CODE and hidden prompts
 remain available as fallbacks. MD-only mode needs no AuthCode.
 The config/connection.ini contains account identifiers and evaluation fronts.
 Read docs/CODE_GUIDE.md and docs/REPORT_ROADMAP.md for scope and next steps.
-No orders, cancels, password changes or settlement confirmations are sent.
+The default connectivity test sends no orders. The basic test is dry-run unless
+--send-order and --confirm SEND_ONE_ORDER are both present; that mode can trade.
+No password changes or settlement confirmations are sent.
 The logs and flow directories will be created during the run.
 
 The original source package is required for rebuilding; it is separate from
