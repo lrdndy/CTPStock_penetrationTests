@@ -106,6 +106,8 @@
 	<error id="NO_COMB_POSITION" value="152" prompt="CTP:找不到组合持仓"/>
 	<error id="MAY_SELFTRADE" value="154" prompt="CTP:可能触发自成交"/>
 	<error id="CLOSE_OPTION_NO_MONEY" value="155" prompt="CTP:平期权权利仓后资金为负（收益小于平仓手续费），只可由风控人员强平"/>
+	<error id="QK_BUSY" value="156" prompt="CTP:查询核心忙 请稍后重试"/>
+	<error id="TK_BUSY" value="157" prompt="CTP:系统忙"/>
 	<!--灾备系统错误代码 -->		
 	<error id="NO_TRADING_RIGHT_IN_SEPC_DR" value="101" prompt="CTP:用户在本系统没有报单权限"/>
 	<error id="NO_DR_NO" value="102" prompt="CTP:系统缺少灾备标示号"/>
@@ -212,6 +214,7 @@
   <error id="BANKACCOUNT_NOT_EMPTY" value="1050" prompt="CTP:银期转账：银行账户不能为空"/>
   <error id="INVALID_RESERVE_OPEN_ACCOUNT" value="1051" prompt="CTP:银期转账：资金账户存在，预约开户失败"/>  
   <error id="FUTURESERIAL_HAS_BEEN_PROCESSED" value="1052" prompt="银期转账：该期货流水号已经处理过"/>
+  <error id="BANK_SYSTEM_INTERNAL_ERROR" value="1053" prompt="银期转账：银行系统内部错误"/>
 <!-- add for transfer begin -->
 	<error id="NO_VALID_BANKOFFER_AVAILABLE" value="2000" prompt="CTP:该报盘未连接到银行"/>
 	<error id="PASSWORD_MISMATCH" value="2001" prompt="CTP:资金密码错误"/>
@@ -227,6 +230,8 @@
 	<error id="AMOUNT_OUTOFTHEWAY" value="2014" prompt="CTP:转帐金额错误"/>
 	<error id="EXCHANGERATE_NOT_FOUND" value="2015" prompt="CTP:找不到汇率"/>
 	<error id="WAITING_OFFER_RSP" value="999999" prompt="CTP:等待银期报盘处理结果"/>
+	<error id="OPEN_ACCOUNT_NOT_DEFAULT_ACCOUNT" value="2016" prompt="CTP:银期转账：开户请求的银行卡号和预留的账号不同"/>
+	<error id="CHECKD_FILE_ARRIVED" value="2017" prompt="CTP:当前对账文件已到达，无需签退"/>
 	<!-- add for transfer end -->
 	<!--换汇系统错误代码 bgn-->
 	<error id="FBE_NO_GET_PLATFORM_SN" value="3001" prompt="CTP:银期换汇：取平台流水号错误"/>

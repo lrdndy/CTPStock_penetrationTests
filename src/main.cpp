@@ -33,7 +33,7 @@
 using namespace ctp_sopt;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock; // 超时用单调时钟，避免系统校时影响等待时间。
-constexpr const char* kVersion = "v0.1.1";
+constexpr const char* kVersion = "v0.1.2";
 constexpr const char* kTraderFront = "tcp://101.226.254.157:32205";
 constexpr const char* kMdFront = "tcp://101.226.254.157:32213";
 
@@ -502,7 +502,7 @@ int main(int argc, char** argv) {
         if (fs::exists(flowDir)) throw std::runtime_error("Flow directory collision; rerun to obtain a new run ID.");
         fs::create_directories(flowDir / "trader"); fs::create_directories(flowDir / "md");
         Logger log(logDir / "run.log", secret);
-        log.write(std::string("PROGRAM version=") + kVersion + " sdk_package=traderAPI_3.7.0_T_20231127");
+        log.write(std::string("PROGRAM version=") + kVersion + " sdk_package=traderAPI_3.7.5_CP_20251125");
         log.write(std::string("API trader=") + CThostFtdcTraderApi::GetApiVersion() + " md=" + CThostFtdcMdApi::GetApiVersion());
         log.write("RUN id=" + runId + " mode=" + options.mode + " user=" + config.user + " broker=" + config.broker);
         log.write("CONFIG app_id=" + config.app + " investor_id=" + config.investor);
