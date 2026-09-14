@@ -33,7 +33,7 @@
 using namespace ctp_sopt;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock; // 超时用单调时钟，避免系统校时影响等待时间。
-constexpr const char* kVersion = "v0.1.0";
+constexpr const char* kVersion = "v0.1.1";
 constexpr const char* kTraderFront = "tcp://101.226.254.157:32205";
 constexpr const char* kMdFront = "tcp://101.226.254.157:32213";
 
@@ -46,6 +46,17 @@ struct Options {
     std::string mode = "all", config = "config/connection.ini";
     int timeout = 30;
     bool skipQuery = false, help = false, version = false;
+};
+
+void eraseSecret(std::string& s) {
+    // 尽量清除当前字符串缓冲；配置文件、操作系统环境和 SDK 内部副本不受此函数控制。
+    volatile char* p = s.empty() ? nullptr : &s[0];
+    for (std::size_t i = 0; i < s.size(); ++i) p[i] = 0;
+    s.clear();
+}
+struct Secrets {
+    std::string password, auth;
+    ~Secrets() { eraseSecret(password); eraseSecret(auth); }
 };
 
 std::string trim(std::string s) {
@@ -76,10 +87,9 @@ Options parseOptions(int argc, char** argv) {
         throw std::runtime_error("--mode must be trader, md, or all.");
     return o;
 }
-Config readConfig(const std::string& path) {
+void readConfigFile(const fs::path& path, Config& c, Secrets& secret) {
     std::ifstream in(path);
     if (!in) throw std::runtime_error("Cannot open configuration file; run from project root or use --config.");
-    Config c;
     std::set<std::string> seen;
     std::string line;
     int number = 0;
@@ -88,7 +98,7 @@ Config readConfig(const std::string& path) {
         if (number == 1 && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
         line = trim(line);
         if (line.empty() || line[0] == '#' || line[0] == ';') continue;
-        if (line == "[connection]") continue;
+        if (line == "[connection]" || line == "[credentials]") continue;
         auto eq = line.find('=');
         if (eq == std::string::npos) throw std::runtime_error("Invalid INI syntax at line " + std::to_string(number));
         std::string key = trim(line.substr(0, eq)), value = trim(line.substr(eq + 1));
@@ -99,8 +109,26 @@ Config readConfig(const std::string& path) {
         else if (key == "trader_front") c.trader = value;
         else if (key == "md_front") c.md = value;
         else if (key == "app_id") c.app = value;
-        else throw std::runtime_error("Unsupported INI key at line " + std::to_string(number) +
-                                      "; password/auth code must use hidden prompts or environment variables.");
+        // 凭据不放进会被日志输出的 Config；空值表示继续使用其他来源。
+        else if (key == "password") { if (!value.empty()) secret.password = value; }
+        else if (key == "auth_code") { if (!value.empty()) secret.auth = value; }
+        else throw std::runtime_error("Unsupported INI key at line " + std::to_string(number));
+    }
+    if (in.bad()) throw std::runtime_error("Failed to read configuration file.");
+}
+Config readConfig(const std::string& path, Secrets& secret) {
+    Config c;
+    const fs::path primary(path);
+    readConfigFile(primary, c, secret);
+    // connection.ini 自动叠加同目录的 connection.local.ini，直接运行 EXE 也生效。
+    // 显式指定 *.local.ini 时只读取该文件，不再寻找 *.local.local.ini。
+    const std::string filename = primary.filename().string();
+    const std::string localSuffix = ".local.ini";
+    if (filename.size() < localSuffix.size() ||
+        filename.compare(filename.size() - localSuffix.size(), localSuffix.size(), localSuffix) != 0) {
+        fs::path local = primary;
+        local.replace_extension(".local.ini");
+        if (fs::exists(local)) readConfigFile(local, c, secret);
     }
     if (c.investor.empty()) c.investor = c.user;
     // 第一阶段固定评测前置和 BrokerID，防止配置误指向其他环境。
@@ -119,29 +147,20 @@ template <std::size_t N> void field(char (&out)[N], const std::string& in, const
 template <std::size_t N> std::string textField(const char (&value)[N]) {
     return std::string(value, std::find(value, value + N, '\0'));
 }
-void eraseSecret(std::string& s) {
-    // 尽量清除当前字符串缓冲；操作系统环境和 SDK 内部副本不受此函数控制。
-    volatile char* p = s.empty() ? nullptr : &s[0];
-    for (std::size_t i = 0; i < s.size(); ++i) p[i] = 0;
-    s.clear();
-}
-struct Secrets {
-    std::string password, auth;
-    ~Secrets() { eraseSecret(password); eraseSecret(auth); }
-};
-std::string getSecret(const char* envName, const char* prompt) {
+std::string getSecret(const std::string& configured, const char* envName, const char* prompt) {
+    if (!configured.empty()) return configured;
     if (const char* value = std::getenv(envName); value && *value) return value;
     std::cout << prompt << std::flush;
 #ifdef _WIN32
     const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
     DWORD oldMode = 0;
     if (!GetConsoleMode(input, &oldMode) || !SetConsoleMode(input, oldMode & ~ENABLE_ECHO_INPUT))
-        throw std::runtime_error("Hidden input requires an interactive console, or set the credential environment variable.");
+        throw std::runtime_error("Set password/auth_code in the INI configuration, set the credential environment variable, or use an interactive console.");
     struct Restore { HANDLE h; DWORD mode; ~Restore() { SetConsoleMode(h, mode); } } restore{input, oldMode};
 #else
     termios oldMode{};
     if (tcgetattr(STDIN_FILENO, &oldMode) != 0)
-        throw std::runtime_error("Hidden input requires a terminal, or set the credential environment variable.");
+        throw std::runtime_error("Set password/auth_code in the INI configuration, set the credential environment variable, or use an interactive terminal.");
     termios hidden = oldMode;
     hidden.c_lflag &= ~ECHO;
     if (tcsetattr(STDIN_FILENO, TCSANOW, &hidden) != 0) throw std::runtime_error("Cannot disable terminal echo.");
@@ -451,15 +470,16 @@ int main(int argc, char** argv) {
             std::cout << "Usage: ctp_stock_connect.exe [--mode all|trader|md] [--config FILE]\n"
                          "       [--timeout 1..300] [--skip-query] [--version] [--help]\n"
                          "Default: all, config/connection.ini, 30 seconds PER STAGE, account query enabled.\n"
-                         "Credentials: hidden console prompts or CTP_PASSWORD / CTP_AUTH_CODE.\n"
+                         "Credentials: nonempty local INI > main INI > CTP_PASSWORD / CTP_AUTH_CODE > hidden prompts.\n"
+                         "config/connection.local.ini is loaded automatically when using the default config.\n"
                          "MD-only mode does not need CTP_AUTH_CODE. No order or password-update operations.\n";
             return 0;
         }
         printVersions();
         if (options.version) return 0; // help/version 不读配置、不索取密码、不连接网络。
-        const Config config = readConfig(options.config);
-        secret.password = getSecret("CTP_PASSWORD", "Trading password (hidden): ");
-        if (options.mode != "md") secret.auth = getSecret("CTP_AUTH_CODE", "Authentication code (hidden): ");
+        const Config config = readConfig(options.config, secret);
+        secret.password = getSecret(secret.password, "CTP_PASSWORD", "Trading password (hidden): ");
+        if (options.mode != "md") secret.auth = getSecret(secret.auth, "CTP_AUTH_CODE", "Authentication code (hidden): ");
         // 先校验所有固定长度字段，避免连上前置后才发现输入被截断或无效。
         (void)loginRequest(config, secret);
         CThostFtdcReqAuthenticateField check{};
