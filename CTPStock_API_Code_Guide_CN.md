@@ -1,8 +1,8 @@
 # 连接与基础功能测试代码讲解
 
-这份工程首先验证本机能否通过所附 CTP 个股期权 SDK 连接指定测试环境，完成客户端认证、交易账户登录及只读查询，并单独验证行情端登录。当前源码版本为 `0.3.0`，使用个股期权 SDK `v3.7.5_CP_20251125`，还包含受显式开关保护的单次限价报单/撤单基础功能测试和每日最大报单量风控。
+这份工程首先验证本机能否通过所附 CTP 个股期权 SDK 连接指定测试环境，完成客户端认证、交易账户登录及只读查询，并单独验证行情端登录。当前源码版本为 `0.4.0`，使用个股期权 SDK `v3.7.5_CP_20251125`，还包含受显式开关保护的单次限价报单测试、撤单与等待成交目标，以及每日和每秒最大报单量风控。
 
-默认 `connectivity` 模式仍不报单。`basic` 模式实现报单数量固定为 1 的单次 GFD 限价委托及进入排队状态后的自动撤单；默认只是 dry-run，必须同时提供 `--send-order --confirm SEND_ONE_ORDER` 才会实发。实发前必须配置报备表的 `daily_max_order_count`，未配置或已达限额时拒绝调用 SDK。程序没有行情选价、追价、自动重试、成交后自动平仓、密码修改、结算确认、每秒限额或异常价格风控。
+默认 `connectivity` 模式仍不报单。`basic` 模式实现报单数量固定为 1 的单次 GFD 限价委托，默认只是 dry-run，必须同时提供 `--send-order --confirm SEND_ONE_ORDER` 才会实发。默认 `--order-goal cancel` 在排队后自动撤单；选择 `--order-goal fill` 后等待成交，超时后最多撤单一次。基础实发模式在读取凭据前要求配置报备表的 `daily_max_order_count` 和 `per_second_max_order_count`；实际发送前联合检查这两个限额。普通连接与基础 dry-run 不要求填入阈值。程序没有行情选价、追价、自动重试、成交后自动平仓、密码修改、结算确认或异常价格风控。
 
 ## 1. 先认识 API 和 SPI
 
@@ -55,8 +55,8 @@ Windows 下 `.lib` 在编译链接时告诉程序如何引用 SDK，`.dll` 在�
 
 | 代码对象 | 负责什么 | 为什么单独写出来 |
 | --- | --- | --- |
-| `Config` | 保存经纪公司、账号、投资者编号、前置地址和 AppID | 接入参数与测试逻辑分开；凭据由独立的 `Secrets` 保存 |
-| `Options` | 保存运行模式、基础测试参数、配置文件路径、超时和是否跳过资金查询 | 默认连接测试与显式基础交易测试共用一个入口 |
+| `Config` | 保存经纪公司、账号、投资者编号、前置地址、AppID 和每日/每秒限额 | 接入参数与测试逻辑分开；凭据由独立的 `Secrets` 保存 |
+| `Options` | 保存运行模式、基础测试参数、撤单/成交目标、配置路径及等待时间 | 默认连接测试与显式基础交易测试共用一个入口 |
 | `parseOptions` | 解析并校验命令行、测试模式、交易所、方向、开平、价格和实发确认令牌 | 缺少完整确认时保持 dry-run，防止误发委托 |
 | `readConfig(path, Secrets&)` | 读取主 INI 和可选同名本地 INI，分别填充连接参数与凭据 | 拒绝同一文件的重复键、未知键和不属于本阶段的前置环境；投资者编号留空时沿用用户编号 |
 | `field` / `textField` | 在 C++ 字符串与 SDK 固定长度字符数组之间转换 | 防止输入静默截断或读取越过字段边界 |
@@ -68,7 +68,7 @@ Windows 下 `.lib` 在编译链接时告诉程序如何引用 SDK，`.dll` 在�
 | `TraderSpi` / `MdSpi` | 覆盖 SDK 回调，将响应转交 `State` | 回调保持短小，实际流程由主线程控制 |
 | `runStage` | 为一个阶段启动等待状态、提交请求、等待并报告 | 各阶段统一处理提交失败和异步失败 |
 | `testTrader` / `testMd` | 组织各自的测试顺序 | 两套 API 独立诊断；基础测试只允许 trader 模式 |
-| `testBasicFunction` | 生成一次策略报单；dry-run 到此停止，实发时等待排队并撤单 | 把策略生成、真实发送和撤单证据明确区分 |
+| `testBasicFunction` | 生成一次策略报单；dry-run 到此停止，实发时执行风控及撤单/成交目标 | 把策略生成、真实发送、成交和撤单证据明确区分 |
 | `ApiDeleter` | 注销 SPI 并调用 API 的 `Release` | 即使提前返回或发生异常，也有确定的释放路径 |
 | `main` | 组合配置、凭据、日志、测试和退出码 | 整个程序的入口及总结果汇总 |
 
@@ -117,7 +117,15 @@ BASIC RESULT status=PASS strategy=PASS order_fields=PASS transmission=NOT_REQUES
 
 这不是柜台报单通过。只有再提供准确的 `--confirm SEND_ONE_ORDER` 才调用 `ReqOrderInsert(..., 4)`。程序不把接口即时返回 `0` 当作订单成功，而是按同一 `OrderRef` 处理 `OnRspOrderInsert`、`OnErrRtnOrderInsert`、`OnRtnOrder` 和 `OnRtnTrade`。
 
-当 `OnRtnOrder` 显示委托仍在队列中，主线程使用回报中的 `FrontID`、`SessionID`、`ExchangeID`、`OrderSysID` 和 `OrderRef` 构造撤单，调用 `ReqOrderAction(..., 5)`。只有后续同一订单状态确认为 `Canceled`，并且确实由程序发起过撤单，才记录 `cancel=PASS`。完全成交、拒绝、非排队终态或超时都不会冒充撤单通过；若超时，日志会要求立即去柜台核对活动委托。
+默认撤单目标下，当 `OnRtnOrder` 显示委托仍在队列中，主线程使用回报中的 `FrontID`、`SessionID`、`ExchangeID`、`OrderSysID` 和 `OrderRef` 构造撤单，调用 `ReqOrderAction(..., 5)`。只有后续同一订单状态确认为 `Canceled`，并且确实由程序发起过撤单，才记录 `cancel=PASS`。完全成交、拒绝、非排队终态或超时都不会冒充撤单通过。
+
+成交目标 `--order-goal fill` 不在第一次排队回报后立即撤单，而是用 `--fill-wait` 指定的时间等待成交（默认 `10` 秒，范围 `1..300` 秒）。完整成交会使本次成交测试通过；未完整成交且到达等待期限时，程序最多调用一次撤单。确认撤单后日志显示 `fill=NOT_FILLED cancel=PASS`，整体仍为失败，因为没有达到成交目标。若无法确认活动委托的最终状态，日志使用 `residual_order=UNKNOWN` 要求人工检查交易终端。程序不会重发、追价或通过另一笔委托补足成交。
+
+使用示例中的合约与价格是占位符，必须替换为当时真实有效的测试参数；开平和方向也需按本次测试目的及可用持仓核对：
+
+```powershell
+.\run_basic_windows.bat --instrument 合约代码 --exchange SSE --direction buy --offset open --price 价格 --order-goal fill --fill-wait 10 --timeout 60 --send-order --confirm SEND_ONE_ORDER
+```
 
 这个 `single-shot-limit` 是测试用的确定性单次策略，不做行情判断。实发委托仍可能在撤单到达前成交；程序会记录 `OnRtnTrade`，但不会自动发第二笔反向单。它的真实能力应按此描述，不能写成行情策略、做市、套利或完整订单管理系统。
 
@@ -196,15 +204,27 @@ API 对象由 SDK 的 `CreateFtdcTraderApi` / `CreateFtdcMdApi` 创建，应按 
 
 释放 API 在主线程执行，不在 SDK 回调里执行。`Join()` 的含义是等待 SDK 线程退出，不是“登录并等结果”；在当前一次性工具中先 `Join()` 再尝试 `Release()` 可能一直卡在等待上，所以程序直接用明确的阶段等待和最终释放。
 
-## 10. 每日最大报单量风控
+## 10. 每日和每秒最大报单量风控
 
-`daily_max_order_count` 是必须由操作人按报备表填入的正整数，配置读入 `Config::dailyMaxOrderCount`。该值为空时，连接测试和基础 dry-run 仍可执行，但实发模式会在索取凭据及连网前拒绝启动。
+`daily_max_order_count` 和 `per_second_max_order_count` 都必须由操作人按报备表填入，合法范围为 `1..999999999`，分别读入 `Config::dailyMaxOrderCount` 和 `Config::perSecondMaxOrderCount`。模板保留空值，不以演示值替代正式阈值。基础实发缺少任一阈值时会在索取凭据及联网前拒绝启动；普通连接与基础 dry-run 可在未填写阈值时运行。升级时须在原有每日配置旁新增每秒配置。设置与触发自测也必须使用两个正式阈值，修改时只需编辑 INI 后重新运行。
 
-`evaluateDailyOrderRisk` 是不读写文件的单一判断函数：当已计数小于阈值时允许并将本次尝试计为 1 笔；已计数大于或等于阈值时返回拦截。`DailyOrderCounter::reserve` 在实际 `ReqOrderInsert` 之前加锁，读取 `state\daily_order_count_<BrokerID>_<UserID>.ini`，用登录回报中的交易日决定是继续累计还是归零，并先原子替换状态文件、再调用 SDK。这种保守口径使 SDK 立即返回失败和柜台后续拒单也都占用 1 笔，撤单不占用。文件损坏、锁超时或写入失败时抛出异常并停止报单，不会在不确定的计数上继续交易。
+`evaluateOrderRisk` 将每日和每秒判断合并，复用 `evaluateDailyOrderRisk` 的每日规则。实际报单入口 `DailyOrderCounter::submit` 先联合检查两个限额，只有都允许才保留本次额度并调用 `ReqOrderInsert`；`reserve` / `reserveAt` 仅用于离线回归。每日按登录回报的交易日计数；每秒按系统运行时间判断最近 `1000` 毫秒的滚动窗口，不按自然秒清零。SDK 立即返回失败、柜台拒单也算一次报单尝试；已达任一限额而被本地阻止时，两个计数均不增加。撤单既不占用报单额度，也不被每秒限额拦截。
 
-风控设置和触发截图分别由 `run_risk_windows.bat settings` 和 `run_risk_windows.bat trigger` 生成。两者在读完配置后直接进入 `runRiskEvidence`，不进入 `getSecret`，也不创建 Trader/MD API 对象。`trigger` 把临时自测计数设为报备阈值，然后调用与实发共用的 `evaluateDailyOrderRisk`；它不读写生产计数文件，弹窗和日志均明确标识自测及未发单。
+`state\daily_order_count_<BrokerID>_<UserID>.ini` 持久保存每日计数、最近报单的系统运行时间戳 `recent_uptime_ms`、观察峰值 `peak_per_second` 和未完成标记 `submission_pending`。v0.3.0 的两字段状态文件可升级并保留每日已用计数。登录交易日变化时，每日计数和观察峰值归零，但仍落在最近 1000 毫秒内的报单继续参与每秒判断。Windows 命名互斥锁覆盖状态读取、联合判断、原子持久化和 SDK 实际提交，使同一作用域中的多个进程共用同一额度；重启单个程序不会清空计数。
 
-当前状态作用域是本项目目录内的当前 BrokerID/UserID，不会合并其他软件或其他项目副本的报单数。如果正式报备口径不同，需要在留证前改造，不能改截图文字代替实现。
+提交前先写入未完成标记；正常 SDK 调用返回后再完成状态更新。若进程在两者之间崩溃，下一次启动发现该标记会拒绝继续报单，避免在提交结果不确定时继续累计交易。若 SDK 已调用但最后的状态写入失败，程序仍继续处理本笔委托及必要撤单，后续报单则由保留的未完成标记阻止。状态损坏、锁超时和提交前写入失败也都拒绝报单。应先人工核对日志和柜台状态，不能直接清空文件以解除风控。
+
+设置与触发入口如下：
+
+| 命令 | 作用 | 是否发送真实委托 |
+| --- | --- | --- |
+| `run_risk_windows.bat settings` | 显示每日、每秒两个正式阈值和统计口径 | 否 |
+| `run_risk_windows.bat trigger` | 离线注入达到每日阈值的计数，触发实际使用的每日判断 | 否 |
+| `run_risk_windows.bat trigger-second` | 离线注入达到每秒阈值的窗口计数，触发实际使用的每秒判断 | 否 |
+
+以上入口读完配置后进入 `runRiskEvidence`，不进入 `getSecret`、不创建 Trader/MD API 对象，也不读写真实计数文件。触发弹窗和日志均明确标记自测，记录 `api_call=NOT_SENT`；它们不是实际发出阈值数量委托的证明。真实每秒检查日志记录 `rule=per_second_max_order_count`、`window_ms=1000`、`submitted_before`、`submitted_after`、`peak_per_second` 与放行/阻止结果。每秒峰值是本作用域已观察的报单峰值，自测注入值不能作为真实吞吐量。
+
+当前作用域是同一机器、本项目目录内的当前 BrokerID/UserID，可共享同一作用域内不同进程的报单数，不会聚合其他机器、其他软件或其他项目副本。如果正式报备口径不同，需要在留证前改造。单次工具每次只发一笔，依次在命令行启动通常达不到较高的每秒阈值；使用离线触发自测检查边界，不用批量真实委托循环凑截图。
 
 ## 11. 凭据、日志和实际运行证据
 
@@ -217,7 +237,7 @@ Copy-Item config\connection.local.ini.example config\connection.local.ini
 notepad config\connection.local.ini
 ```
 
-填入交易密码与认证码后保存为 UTF-8：
+填入交易密码、认证码及报备表中的两个风控阈值后保存为 UTF-8：
 
 ```ini
 [credentials]
@@ -225,7 +245,8 @@ password=填写交易密码
 auth_code=填写认证码
 
 [risk]
-daily_max_order_count=填写报备表整数
+daily_max_order_count=填写报备表每日整数
+per_second_max_order_count=填写报备表每秒整数
 ```
 
 之后继续使用原来的 `run_windows.bat` 即可，无需新增参数或每次输入。已有本地文件时不要再复制模板覆盖；以后修改凭据只需编辑本地文件，不需要重新编译。
@@ -238,7 +259,7 @@ daily_max_order_count=填写报备表整数
 
 解析器以每行第一个 `=` 分隔键和值，并去掉值两端空白。值中的 `#`、`;` 和后续 `=` 都是字面字符；因此不要在值后面附加注释，也不需要加引号。每个文件内部仍检查重复键和未知键，不把错误行及凭据值回显到错误信息。
 
-公开仓库保存空模板，真实 `*.local.ini` 由 `.gitignore` 排除。凭据文件在本机以明文保存。`package_release.ps1` 不包含真实本地配置，并从运行包的主配置副本中去掉 `password` / `auth_code` 行，保留空模板；接收运行包的人需要在自己的电脑填写一次。风控核心已做离线边界与持久化回归，但维护环境不能执行 Windows `MessageBoxW`；不能把离线验证当作现场弹窗或柜台证据。
+公开仓库保存空模板，真实 `*.local.ini` 由 `.gitignore` 排除。凭据文件在本机以明文保存。`package_release.ps1` 不包含真实本地配置，并从运行包的主配置副本中去掉 `password` / `auth_code` 行，保留空模板；接收运行包的人需要在自己的电脑填写一次。离线验证范围见 `docs/VALIDATION.md`；维护环境不能执行完整 MSVC 构建、Windows `MessageBoxW` 或柜台成交，不能把离线验证当作现场弹窗或柜台证据。
 
 ### 日志与凭据生命周期
 
@@ -258,12 +279,12 @@ daily_max_order_count=填写报备表整数
 | `1` | 至少一个实际执行的测试阶段失败 |
 | `2` | 参数、配置、凭据、文件或对象创建等流程发生异常 |
 
-日志里的 `RESULT overall=PASS` 只指本次实际选择的范围。连接模式不能证明交易；基础 dry-run 不能证明柜台接受报单；风控截图自测只证明每日限额判断和提示被触发，不表示真实发出过阈值数量的委托。单次实发或该自测通过也不等于附件六整体通过，仍不证明两个交易所都已完成实测、每秒限额、异常价格风控、录屏、手册或安全检测。
+日志里的 `RESULT overall=PASS` 只指本次实际选择的范围。连接模式不能证明交易；基础 dry-run 不能证明柜台接受报单；撤单目标和成交目标各有自己的通过条件。风控截图自测只证明每日或每秒判断和提示被触发，不表示真实发出过阈值数量的委托。单次实发或该自测通过也不等于附件六整体通过，仍不证明两所都已实测、正式阈值及统计口径已核对、异常价格风控已实现，或录屏、手册和安全检测已经完成。
 
 ## 12. 后面怎样扩展比较清楚
 
 后续可以沿用“主线程发起一个明确动作、SPI 接收并复制响应、状态对象关联请求、日志记录真实结果”的结构。当前 `OrderLifecycle` 已将单次委托的排队、拒绝、成交和撤单与普通 `bIsLast` 请求分开，但它不是持久订单管理器，也不查询全部委托、成交或持仓。
 
-每日计数已接到 `ReqOrderInsert` 之前，但留证时仍必须填入正式报备阈值并确认作用域与报备口径一致。每秒速率和价格检查仍需要明确参数并接到同一个报单入口，不能把 `VolumeTotalOriginal=1` 保护写成这两项风控。
+每日和每秒联合风控已接到 `ReqOrderInsert` 入口，留证时仍必须填入两个正式报备阈值，并确认滚动窗口及作用域与报备口径一致。异常价格检查仍需要明确参考行情和规则后接到同一个入口，不能把 `VolumeTotalOriginal=1` 或限价委托本身写成异常价格风控。
 
 先用当前工具确认交易和行情接入链路，再逐项增加可验证功能，能让每次失败都对应一个清楚的问题。每增加一项实际功能，再同步更新使用说明、测试范围和证据要求。

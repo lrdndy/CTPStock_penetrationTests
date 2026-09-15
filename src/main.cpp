@@ -6,11 +6,13 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -20,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -29,6 +32,8 @@
 #endif
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <sys/file.h>
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -36,7 +41,7 @@
 using namespace ctp_sopt;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock; // 超时用单调时钟，避免系统校时影响等待时间。
-constexpr const char* kVersion = "v0.3.0";
+constexpr const char* kVersion = "v0.4.0";
 constexpr const char* kTraderFront = "tcp://101.226.254.157:32205";
 constexpr const char* kMdFront = "tcp://101.226.254.157:32213";
 
@@ -45,12 +50,14 @@ struct Config {
     std::string trader = kTraderFront, md = kMdFront;
     std::string app = "client_shunjingsf_v1.0.0"; // 券商分配的 AppID，独立于本程序版本。
     int dailyMaxOrderCount = 0; // 0 表示尚未按报备表配置；实发报单将拒绝启动。
+    int perSecondMaxOrderCount = 0; // 最近连续 1000ms 内报单尝试上限，必须显式配置。
 };
 struct Options {
     std::string mode = "all", config = "config/connection.ini";
     std::string test = "connectivity", instrument, exchange, direction, offset, confirmation, riskAction;
+    std::string orderGoal = "cancel";
     double price = 0.0;
-    int timeout = 30;
+    int timeout = 30, fillWait = 10;
     bool skipQuery = false, sendOrder = false, help = false, version = false;
 };
 
@@ -77,8 +84,15 @@ int parseDailyMaxOrderCount(const std::string& value) {
         throw std::runtime_error("daily_max_order_count must be an integer from 1 to 999999999.");
     return static_cast<int>(parsed);
 }
+int parsePerSecondMaxOrderCount(const std::string& value) {
+    try { return parseDailyMaxOrderCount(value); }
+    catch (const std::exception&) {
+        throw std::runtime_error("per_second_max_order_count must be an integer from 1 to 999999999.");
+    }
+}
 Options parseOptions(int argc, char** argv) {
     Options o;
+    bool orderGoalProvided = false, fillWaitProvided = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") { o.help = true; continue; }
@@ -87,7 +101,8 @@ Options parseOptions(int argc, char** argv) {
         if (arg == "--send-order") { o.sendOrder = true; continue; }
         if (arg != "--mode" && arg != "--config" && arg != "--timeout" && arg != "--test" &&
             arg != "--instrument" && arg != "--exchange" && arg != "--direction" &&
-            arg != "--offset" && arg != "--price" && arg != "--confirm" && arg != "--risk-action")
+            arg != "--offset" && arg != "--price" && arg != "--confirm" && arg != "--risk-action" &&
+            arg != "--order-goal" && arg != "--fill-wait")
             throw std::runtime_error("Unknown option; use --help.");
         if (++i == argc) throw std::runtime_error("Missing option value; use --help.");
         std::string value = argv[i];
@@ -105,6 +120,14 @@ Options parseOptions(int argc, char** argv) {
         else if (arg == "--offset") o.offset = value;
         else if (arg == "--confirm") o.confirmation = value;
         else if (arg == "--risk-action") o.riskAction = value;
+        else if (arg == "--order-goal") { o.orderGoal = value; orderGoalProvided = true; }
+        else if (arg == "--fill-wait") {
+            fillWaitProvided = true;
+            if (value.empty() || value.size() > 3 || value.find_first_not_of("0123456789") != std::string::npos)
+                throw std::runtime_error("--fill-wait must be 1..300 seconds.");
+            o.fillWait = std::stoi(value);
+            if (o.fillWait < 1 || o.fillWait > 300) throw std::runtime_error("--fill-wait must be 1..300 seconds.");
+        }
         else if (arg == "--price") {
             std::size_t used = 0;
             try { o.price = std::stod(value, &used); }
@@ -117,6 +140,12 @@ Options parseOptions(int argc, char** argv) {
         throw std::runtime_error("--mode must be trader, md, or all.");
     if (o.test != "connectivity" && o.test != "basic" && o.test != "risk")
         throw std::runtime_error("--test must be connectivity, basic, or risk.");
+    if (o.orderGoal != "cancel" && o.orderGoal != "fill")
+        throw std::runtime_error("--order-goal must be cancel or fill.");
+    if ((orderGoalProvided || fillWaitProvided) && o.test != "basic")
+        throw std::runtime_error("--order-goal and --fill-wait require --test basic.");
+    if (fillWaitProvided && o.orderGoal != "fill")
+        throw std::runtime_error("--fill-wait requires --order-goal fill.");
     if (o.test == "connectivity") {
         if (o.sendOrder || !o.instrument.empty() || !o.exchange.empty() || !o.direction.empty() ||
             !o.offset.empty() || o.price != 0.0 || !o.confirmation.empty() || !o.riskAction.empty())
@@ -139,13 +168,15 @@ Options parseOptions(int argc, char** argv) {
             throw std::runtime_error("Live basic test does not allow --skip-query.");
         if (!o.riskAction.empty()) throw std::runtime_error("--risk-action requires --test risk.");
     } else {
-        if (o.riskAction != "settings" && o.riskAction != "trigger")
-            throw std::runtime_error("--test risk requires --risk-action settings or trigger.");
+        if (o.riskAction != "settings" && o.riskAction != "trigger" && o.riskAction != "trigger-second")
+            throw std::runtime_error("--test risk requires --risk-action settings, trigger, or trigger-second.");
         if (o.sendOrder || o.skipQuery || !o.instrument.empty() || !o.exchange.empty() ||
             !o.direction.empty() || !o.offset.empty() || o.price != 0.0)
             throw std::runtime_error("Risk evidence mode does not accept connectivity or order options.");
         if (o.riskAction == "trigger" && o.confirmation != "TRIGGER_DAILY_ORDER_LIMIT")
             throw std::runtime_error("Risk trigger self-test requires --confirm TRIGGER_DAILY_ORDER_LIMIT.");
+        if (o.riskAction == "trigger-second" && o.confirmation != "TRIGGER_SECOND_ORDER_LIMIT")
+            throw std::runtime_error("Per-second risk trigger self-test requires --confirm TRIGGER_SECOND_ORDER_LIMIT.");
         if (o.riskAction == "settings" && !o.confirmation.empty())
             throw std::runtime_error("Risk settings display does not accept --confirm.");
     }
@@ -175,6 +206,9 @@ void readConfigFile(const fs::path& path, Config& c, Secrets& secret) {
         else if (key == "app_id") c.app = value;
         else if (key == "daily_max_order_count") {
             if (!value.empty()) c.dailyMaxOrderCount = parseDailyMaxOrderCount(value);
+        }
+        else if (key == "per_second_max_order_count") {
+            if (!value.empty()) c.perSecondMaxOrderCount = parsePerSecondMaxOrderCount(value);
         }
         // 凭据不放进会被日志输出的 Config；空值表示继续使用其他来源。
         else if (key == "password") { if (!value.empty()) secret.password = value; }
@@ -257,7 +291,8 @@ std::string orderPlanText(const Options& o, const std::string& orderRef) {
     line << "strategy=single-shot-limit instrument=" << o.instrument
          << " exchange=" << o.exchange << " direction=" << o.direction
          << " offset=" << o.offset << " limit_price=" << std::fixed << std::setprecision(6) << o.price
-         << " volume=1 time_condition=GFD order_ref=" << orderRef;
+         << " volume=1 time_condition=GFD order_ref=" << orderRef << " order_goal=" << o.orderGoal;
+    if (o.orderGoal == "fill") line << " fill_wait_seconds=" << o.fillWait;
     return line.str();
 }
 std::string getSecret(const std::string& configured, const char* envName, const char* prompt) {
@@ -397,6 +432,8 @@ struct DailyOrderRiskDecision {
     int submittedBefore = 0;
     int submittedAfter = 0;
     std::string tradingDay;
+    int perSecondLimit = 0, secondBefore = 0, secondAfter = 0, peakPerSecond = 0;
+    std::string blockedRule;
 };
 DailyOrderRiskDecision evaluateDailyOrderRisk(int configuredLimit, int submittedBefore,
                                               const std::string& tradingDay) {
@@ -408,7 +445,32 @@ DailyOrderRiskDecision evaluateDailyOrderRisk(int configuredLimit, int submitted
     result.submittedBefore = submittedBefore;
     result.submittedAfter = submittedBefore + (result.allowed ? 1 : 0);
     result.tradingDay = tradingDay;
+    if (!result.allowed) result.blockedRule = "daily_max_order_count";
     return result;
+}
+DailyOrderRiskDecision evaluateOrderRisk(int dailyLimit, int dailyCount, int secondLimit,
+                                         int secondCount, const std::string& tradingDay) {
+    if (secondLimit < 1 || secondCount < 0)
+        throw std::runtime_error("Invalid per-second order risk-control state.");
+    auto result = evaluateDailyOrderRisk(dailyLimit, dailyCount, tradingDay);
+    result.perSecondLimit = secondLimit;
+    result.secondBefore = result.secondAfter = secondCount;
+    if (result.allowed && secondCount >= secondLimit) {
+        result.allowed = false;
+        result.blockedRule = "per_second_max_order_count";
+        result.submittedAfter = dailyCount;
+    }
+    if (result.allowed) ++result.secondAfter;
+    result.peakPerSecond = result.secondAfter;
+    return result;
+}
+std::uint64_t orderUptimeMs() {
+#ifdef _WIN32
+    return static_cast<std::uint64_t>(GetTickCount64());
+#else
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now().time_since_epoch()).count());
+#endif
 }
 bool validTradingDay(const std::string& value) {
     return value.size() == 8 && value.find_first_not_of("0123456789") == std::string::npos;
@@ -433,10 +495,20 @@ fs::path dailyOrderStatePath(const Config& c) {
         ("daily_order_count_" + safeFilePart(c.broker) + "_" + safeFilePart(c.user) + ".ini");
 }
 
+struct OrderSubmission {
+    DailyOrderRiskDecision risk;
+    int immediateRc = 0;
+    bool stateFinalized = true;
+};
 class DailyOrderCounter {
-    struct StoredState { std::string tradingDay; int submittedCount = 0; };
+    struct StoredState {
+        std::string tradingDay;
+        int submittedCount = 0, peakPerSecond = 0;
+        std::vector<std::uint64_t> recent;
+        bool pending = false;
+    };
     fs::path path_;
-    int configuredLimit_;
+    int configuredLimit_, secondLimit_;
 #ifdef _WIN32
     HANDLE mutex_ = nullptr;
 #endif
@@ -446,7 +518,7 @@ class DailyOrderCounter {
         std::ifstream input(path_, std::ios::binary);
         if (!input) throw std::runtime_error("Daily order count state cannot be opened; order blocked.");
         StoredState state;
-        bool sawDay = false, sawCount = false;
+        bool sawDay = false, sawCount = false, sawRecent = false, sawPeak = false, sawPending = false;
         std::string line;
         while (std::getline(input, line)) {
             line = trim(line);
@@ -467,12 +539,40 @@ class DailyOrderCounter {
                 if (parsed < 0 || parsed > 999999999)
                     throw std::runtime_error("Daily order count value is invalid; order blocked.");
                 state.submittedCount = static_cast<int>(parsed); sawCount = true;
+            } else if (key == "recent_uptime_ms" && !sawRecent) {
+                sawRecent = true;
+                if (!value.empty()) {
+                    std::istringstream values(value);
+                    std::string part;
+                    if (value.back() == ',') throw std::runtime_error("Invalid recent order timestamps; order blocked.");
+                    while (std::getline(values, part, ',')) {
+                        if (part.empty() || part.size() > 19 || part.find_first_not_of("0123456789") != std::string::npos)
+                            throw std::runtime_error("Invalid recent order timestamps; order blocked.");
+                        const auto tick = std::stoull(part);
+                        if (!state.recent.empty() && tick < state.recent.back())
+                            throw std::runtime_error("Unsorted recent order timestamps; order blocked.");
+                        state.recent.push_back(tick);
+                    }
+                }
+            } else if (key == "peak_per_second" && !sawPeak) {
+                if (value.empty() || value.size() > 9 || value.find_first_not_of("0123456789") != std::string::npos)
+                    throw std::runtime_error("Invalid per-second peak value; order blocked.");
+                state.peakPerSecond = std::stoi(value); sawPeak = true;
+            } else if (key == "submission_pending" && !sawPending) {
+                if (value != "0" && value != "1")
+                    throw std::runtime_error("Invalid pending submission state; order blocked.");
+                state.pending = value == "1"; sawPending = true;
             } else {
                 throw std::runtime_error("Daily order count state has duplicate or unknown fields; order blocked.");
             }
         }
         if (input.bad() || !sawDay || !sawCount)
             throw std::runtime_error("Daily order count state is incomplete; order blocked.");
+        // v0.3.0 的两字段文件保留原每日计数；扩展字段必须整组存在。
+        if ((sawRecent || sawPeak || sawPending) && !(sawRecent && sawPeak && sawPending))
+            throw std::runtime_error("Per-second order state is incomplete; order blocked.");
+        if (state.recent.size() > 999999999u)
+            throw std::runtime_error("Too many recent order timestamps; order blocked.");
         return state;
     }
     void writeLocked(const StoredState& state) const {
@@ -483,7 +583,15 @@ class DailyOrderCounter {
             std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
             if (!output) throw std::runtime_error("Daily order count state cannot be written; order blocked.");
             output << "trading_day=" << state.tradingDay << '\n'
-                   << "submitted_count=" << state.submittedCount << '\n';
+                   << "submitted_count=" << state.submittedCount << '\n'
+                   << "peak_per_second=" << state.peakPerSecond << '\n'
+                   << "submission_pending=" << (state.pending ? 1 : 0) << '\n'
+                   << "recent_uptime_ms=";
+            for (std::size_t i = 0; i < state.recent.size(); ++i) {
+                if (i) output << ',';
+                output << state.recent[i];
+            }
+            output << '\n';
             output.flush();
             if (!output) {
                 std::error_code ignored; fs::remove(temporary, ignored);
@@ -504,26 +612,71 @@ class DailyOrderCounter {
         }
 #endif
     }
-    DailyOrderRiskDecision reserveLocked(const std::string& tradingDay) {
+    DailyOrderRiskDecision reserveLocked(const std::string& tradingDay, std::uint64_t now, bool pending = false) {
         StoredState state = readLocked();
+        if (state.pending)
+            throw std::runtime_error("Previous submission was interrupted; reconcile the order and risk state before sending again.");
+        bool stateChanged = false;
         if (state.tradingDay != tradingDay) {
             state.tradingDay = tradingDay;
             state.submittedCount = 0;
+            state.peakPerSecond = 0;
+            stateChanged = true; // 日计数重置，但最近一秒窗口不因换日清空。
         }
-        const auto decision = evaluateDailyOrderRisk(configuredLimit_, state.submittedCount, tradingDay);
+        if (!state.recent.empty() && state.recent.back() > now) {
+            // 主机重启导致 uptime 回退：旧记录从此刻保守保留一整秒。
+            std::fill(state.recent.begin(), state.recent.end(), now);
+            stateChanged = true;
+        }
+        const auto first = std::find_if(state.recent.begin(), state.recent.end(),
+            [now](std::uint64_t tick) { return now - tick < 1000; });
+        if (first != state.recent.begin()) {
+            state.recent.erase(state.recent.begin(), first);
+            stateChanged = true;
+        }
+        auto decision = secondLimit_ > 0
+            ? evaluateOrderRisk(configuredLimit_, state.submittedCount, secondLimit_,
+                                static_cast<int>(state.recent.size()), tradingDay)
+            : evaluateDailyOrderRisk(configuredLimit_, state.submittedCount, tradingDay);
         if (decision.allowed) {
             state.submittedCount = decision.submittedAfter;
-            writeLocked(state); // 先保守计数，再实际调用 ReqOrderInsert；失败或拒单也属于一次报单尝试。
+            if (secondLimit_ > 0) state.recent.push_back(now);
+            state.pending = pending;
+            stateChanged = true;
         }
+        state.peakPerSecond = std::max(state.peakPerSecond, static_cast<int>(state.recent.size()));
+        decision.peakPerSecond = state.peakPerSecond;
+        if (stateChanged) writeLocked(state);
         return decision;
+    }
+    template<class Operation> auto locked(Operation operation) -> decltype(operation()) {
+#ifdef _WIN32
+        const DWORD wait = WaitForSingleObject(mutex_, 5000);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
+            throw std::runtime_error("Order risk lock timeout; order blocked.");
+        struct Release { HANDLE handle; ~Release() { ReleaseMutex(handle); } } release{mutex_};
+#else
+        fs::create_directories(path_.parent_path());
+        const std::string lockPath = path_.string() + ".lock";
+        const int fd = open(lockPath.c_str(), O_CREAT | O_RDWR, 0600);
+        if (fd < 0) throw std::runtime_error("Order risk lock cannot be opened; order blocked.");
+        struct Release { int fd; ~Release() { flock(fd, LOCK_UN); close(fd); } } release{fd};
+        const auto deadline = Clock::now() + std::chrono::seconds(5);
+        while (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            if (Clock::now() >= deadline) throw std::runtime_error("Order risk lock timeout; order blocked.");
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+#endif
+        return operation();
     }
 public:
     DailyOrderCounter(fs::path path, int configuredLimit, const Config& c)
-        : path_(std::move(path)), configuredLimit_(configuredLimit) {
+        : path_(std::move(path)), configuredLimit_(configuredLimit), secondLimit_(c.perSecondMaxOrderCount) {
         if (configuredLimit_ < 1) throw std::runtime_error("daily_max_order_count is not configured; order blocked.");
 #ifdef _WIN32
         const std::string suffix = safeFilePart(c.broker) + "_" + safeFilePart(c.user);
-        const std::wstring name = L"Local\\CTPStockConnectivity_DailyOrderCount_" +
+        // Global 防止同机不同 Windows 登录会话对同一计数文件分别加锁。
+        const std::wstring name = L"Global\\CTPStockConnectivity_OrderRisk_" +
                                   std::wstring(suffix.begin(), suffix.end());
         mutex_ = CreateMutexW(nullptr, FALSE, name.c_str());
         if (!mutex_) throw std::runtime_error("Daily order count mutex creation failed; order blocked.");
@@ -539,34 +692,52 @@ public:
     DailyOrderCounter(const DailyOrderCounter&) = delete;
     DailyOrderCounter& operator=(const DailyOrderCounter&) = delete;
     DailyOrderRiskDecision reserve(const std::string& tradingDay) {
+        return reserveAt(tradingDay, orderUptimeMs());
+    }
+    // 确定性离线边界测试入口；实发只能使用 submit，时钟由程序获取。
+    DailyOrderRiskDecision reserveAt(const std::string& tradingDay, std::uint64_t now) {
         if (!validTradingDay(tradingDay))
             throw std::runtime_error("Login did not return a valid trading day; order blocked by risk control.");
-#ifdef _WIN32
-        const DWORD wait = WaitForSingleObject(mutex_, 5000);
-        if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
-            throw std::runtime_error("Daily order count lock timeout; order blocked.");
-        struct Release { HANDLE handle; ~Release() { ReleaseMutex(handle); } } release{mutex_};
-        return reserveLocked(tradingDay);
-#else
-        static std::mutex fallbackMutex;
-        std::lock_guard<std::mutex> lock(fallbackMutex);
-        return reserveLocked(tradingDay);
-#endif
+        return locked([&] { return reserveLocked(tradingDay, now); });
+    }
+    OrderSubmission submit(const std::string& tradingDay, const std::function<int()>& send) {
+        if (!validTradingDay(tradingDay) || secondLimit_ < 1)
+            throw std::runtime_error("Live order requires a valid trading day and both configured risk limits.");
+        return locked([&] {
+            OrderSubmission result;
+            result.risk = reserveLocked(tradingDay, orderUptimeMs(), true);
+            if (!result.risk.allowed) return result;
+            // 持锁直到 SDK 调用返回，防止多进程通过检查后延迟集中发送。
+            result.immediateRc = send();
+            try {
+                StoredState state = readLocked();
+                const auto completed = orderUptimeMs();
+                if (!state.recent.empty()) state.recent.back() = std::max(state.recent.back(), completed);
+                state.pending = false;
+                writeLocked(state);
+            } catch (...) {
+                // 已调用 SDK，不能再以“未发单”退出；后续继续核对订单/撤单回报。
+                result.stateFinalized = false;
+            }
+            return result;
+        });
     }
 };
 
-void showRiskSettingsDialog(int configuredLimit) {
+void showRiskSettingsDialog(int configuredLimit, int perSecondLimit) {
 #ifdef _WIN32
-    const std::wstring text = L"风控设置（每日最大报单量）\n\n"
+    const std::wstring text = L"风控设置（每日／每秒最大报单量）\n\n"
         L"报备阈值／每日最大报单量：" + std::to_wstring(configuredLimit) + L" 笔\n"
         L"配置项：daily_max_order_count\n"
+        L"报备阈值／每秒最大报单量：" + std::to_wstring(perSecondLimit) + L" 笔／秒\n"
+        L"配置项：per_second_max_order_count\n"
         L"统计口径：每次 ReqOrderInsert 调用计 1 笔\n"
-        L"统计周期：交易日\n"
+        L"统计周期：每日按交易日；每秒按最近连续 1000 毫秒\n"
         L"计数范围：当前账号及本项目目录";
     MessageBoxW(nullptr, text.c_str(), L"CTPStockConnectivity 风控设置",
                 MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
 #else
-    (void)configuredLimit;
+    (void)configuredLimit; (void)perSecondLimit;
 #endif
 }
 void showRiskTriggerDialog(const DailyOrderRiskDecision& decision, bool selfTest);
@@ -594,8 +765,8 @@ fs::path createRunLogDirectory(std::string& runId) {
     return logDir;
 }
 bool runRiskEvidence(const Config& c, const Options& o, const Secrets& secret) {
-    if (c.dailyMaxOrderCount < 1)
-        throw std::runtime_error("Risk evidence requires daily_max_order_count in config/connection.local.ini.");
+    if (c.dailyMaxOrderCount < 1 || c.perSecondMaxOrderCount < 1)
+        throw std::runtime_error("Risk evidence requires daily_max_order_count and per_second_max_order_count in config/connection.local.ini.");
     std::string runId;
     const fs::path logDir = createRunLogDirectory(runId);
     Logger log(logDir / "run.log", secret);
@@ -605,28 +776,40 @@ bool runRiskEvidence(const Config& c, const Options& o, const Secrets& secret) {
     log.write("RISK CONFIG rule=daily_max_order_count configured_limit=" +
               std::to_string(c.dailyMaxOrderCount) +
               " unit=orders counting_rule=ReqOrderInsert_attempts period=trading_day");
+    log.write("RISK CONFIG rule=per_second_max_order_count configured_limit=" +
+              std::to_string(c.perSecondMaxOrderCount) +
+              " unit=orders_per_second window_ms=1000 window=ROLLING counting_rule=ReqOrderInsert_attempts");
     log.write("RISK NOTICE evidence_mode=LOCAL_SELF_TEST network=NOT_CONNECTED credentials=NOT_USED order_api=NOT_CALLED");
     if (o.riskAction == "settings") {
-        showRiskSettingsDialog(c.dailyMaxOrderCount);
+        showRiskSettingsDialog(c.dailyMaxOrderCount, c.perSecondMaxOrderCount);
         log.write("RISK RESULT status=PASS action=settings screenshot_dialog=REQUESTED");
     } else {
-        const auto decision = evaluateDailyOrderRisk(c.dailyMaxOrderCount, c.dailyMaxOrderCount,
-                                                     localCalendarDay());
-        log.write("RISK SELF_TEST injected_submitted_count=" + std::to_string(decision.submittedBefore) +
-                  " configured_limit=" + std::to_string(decision.configuredLimit) +
+        const bool second = o.riskAction == "trigger-second";
+        const auto decision = evaluateOrderRisk(c.dailyMaxOrderCount, second ? 0 : c.dailyMaxOrderCount,
+                                                c.perSecondMaxOrderCount, second ? c.perSecondMaxOrderCount : 0,
+                                                localCalendarDay());
+        log.write("RISK SELF_TEST rule=" + decision.blockedRule +
+                  " injected_submitted_count=" + std::to_string(second ? decision.secondBefore : decision.submittedBefore) +
+                  " configured_limit=" + std::to_string(second ? decision.perSecondLimit : decision.configuredLimit) +
+                  " window=" + (second ? "ROLLING_1000_MS" : "TRADING_DAY") +
                   " production_state_file=NOT_READ_OR_WRITTEN");
         showRiskTriggerDialog(decision, true);
-        log.write("RISK TRIGGER rule=daily_max_order_count decision=BLOCK api_call=NOT_SENT");
-        log.write("RISK RESULT status=PASS action=trigger control=BLOCKED_AS_EXPECTED");
+        log.write("RISK TRIGGER rule=" + decision.blockedRule + " decision=BLOCK api_call=NOT_SENT");
+        log.write("RISK RESULT status=PASS action=" + o.riskAction + " control=BLOCKED_AS_EXPECTED");
     }
     log.write("EVIDENCE log=" + fs::absolute(logDir / "run.log").string());
     return true;
 }
 void showRiskTriggerDialog(const DailyOrderRiskDecision& decision, bool selfTest) {
 #ifdef _WIN32
-    const std::wstring text = L"风控触发：已达到每日最大报单量\n\n"
-        L"报备阈值：" + std::to_wstring(decision.configuredLimit) + L" 笔\n"
+    const bool second = decision.blockedRule == "per_second_max_order_count";
+    const std::wstring text = std::wstring(second ? L"风控触发：已达到每秒最大报单量\n\n"
+                                                   : L"风控触发：已达到每日最大报单量\n\n") +
+        L"每日报备阈值：" + std::to_wstring(decision.configuredLimit) + L" 笔\n"
         L"当日已计数：" + std::to_wstring(decision.submittedBefore) + L" 笔\n"
+        L"每秒报备阈值：" + std::to_wstring(decision.perSecondLimit) + L" 笔／秒\n"
+        L"最近连续 1000 毫秒已计数：" + std::to_wstring(decision.secondBefore) + L" 笔\n"
+        + (selfTest ? L"自测窗口峰值：" : L"当日观察到的每秒峰值：") + std::to_wstring(decision.peakPerSecond) + L" 笔／秒\n"
         L"本次报单：已在本地拦截，未发送至柜台\n"
         L"测试触发：" + std::wstring(selfTest ? L"是（未发送真实报单）" : L"否");
     MessageBoxW(nullptr, text.c_str(), L"CTPStockConnectivity 风控触发",
@@ -735,6 +918,7 @@ public:
 
 struct OrderResult {
     bool readyToCancel = false, done = false, ok = false, cancelAttempted = false;
+    bool accepted = false, filled = false, canceled = false, cancelVerified = false, residualUnknown = false;
     int tradedVolume = 0;
     std::string reason;
     CThostFtdcOrderField order{};
@@ -748,7 +932,12 @@ class OrderLifecycle {
     std::string orderRef_;
     bool readyToCancel_ = false, done_ = false, ok_ = false, cancelAttempted_ = false;
     bool cancelResponseKnown_ = false, cancelSubmissionAccepted_ = false, canceledObserved_ = false;
-    int tradedVolume_ = 0;
+    bool cancelRejected_ = false;
+    bool fillGoal_ = false, acceptedObserved_ = false, filledObserved_ = false, residualUnknown_ = true;
+    int orderTradedVolume_ = 0, tradeCallbackVolume_ = 0, unidentifiedTradeVolume_ = 0;
+    bool orderIdentityVerified_ = false;
+    std::set<std::string> tradeIds_;
+    std::vector<CThostFtdcTradeField> pendingTrades_;
     std::string reason_;
     CThostFtdcOrderField order_{};
 
@@ -759,91 +948,180 @@ class OrderLifecycle {
         if (done_) return;
         done_ = true; ok_ = false; reason_ = reason; cv_.notify_all();
     }
+    void filled() {
+        // 本程序只发一张；ALL_TRADED 或真实成交回报即可确认成交，不需要两种回调都收到。
+        filledObserved_ = true; acceptedObserved_ = true; residualUnknown_ = false;
+        done_ = true; ok_ = fillGoal_;
+        reason_ = fillGoal_ ? "one-lot order filled; fill goal verified"
+                           : "order fully traded before cancellation; financial effect occurred and cancel was not verified";
+        cv_.notify_all();
+    }
+    void canceled() {
+        if (!cancelAttempted_) {
+            done_ = true; ok_ = false;
+            reason_ = "order canceled before this program submitted cancellation";
+        } else if (cancelResponseKnown_) {
+            done_ = true; ok_ = !fillGoal_ && cancelSubmissionAccepted_ && !cancelRejected_;
+            reason_ = fillGoal_ ? "fill goal not reached; remaining quantity canceled"
+                      : cancelSubmissionAccepted_ && !cancelRejected_ ? "order accepted and remaining quantity canceled"
+                      : "order canceled but this program's cancellation submission was rejected";
+        }
+        cv_.notify_all();
+    }
+    void verifiedTrade(const CThostFtdcTradeField& trade) {
+        // 成交回报没有 FrontID/SessionID。只使用本会话报单回报确认的交易所报单编号。
+        if (!orderIdentityVerified_ || trim(textField(trade.OrderSysID)).empty() ||
+            trim(textField(order_.OrderSysID)) != trim(textField(trade.OrderSysID)) ||
+            trim(textField(order_.ExchangeID)) != trim(textField(trade.ExchangeID))) return;
+        const std::string tradeId = trim(textField(trade.TradeID));
+        if (tradeId.empty()) unidentifiedTradeVolume_ = std::max(unidentifiedTradeVolume_, trade.Volume);
+        else if (tradeIds_.insert(textField(trade.ExchangeID) + ":" + tradeId).second)
+            tradeCallbackVolume_ += trade.Volume;
+        if (std::max(tradeCallbackVolume_, unidentifiedTradeVolume_) >= 1) filled();
+    }
     OrderResult snapshot() const {
         OrderResult result;
         result.readyToCancel = readyToCancel_; result.done = done_; result.ok = ok_;
-        result.cancelAttempted = cancelAttempted_; result.tradedVolume = tradedVolume_;
+        result.cancelAttempted = cancelAttempted_;
+        // 两种回调是同一成交的不同证据，不能把累计成交量和逐笔成交量相加。
+        result.tradedVolume = std::max({orderTradedVolume_, tradeCallbackVolume_, unidentifiedTradeVolume_});
+        result.accepted = acceptedObserved_; result.filled = filledObserved_;
+        result.canceled = canceledObserved_; result.residualUnknown = residualUnknown_;
+        result.cancelVerified = canceledObserved_ && cancelAttempted_ && cancelResponseKnown_ &&
+                                cancelSubmissionAccepted_ && !cancelRejected_;
         result.reason = reason_; result.order = order_;
         return result;
     }
 public:
-    void start(std::string orderRef) {
+    void start(std::string orderRef, bool fillGoal = false,
+               const CThostFtdcOrderField& identifiers = CThostFtdcOrderField{}) {
         std::lock_guard<std::mutex> lock(mutex_);
         orderRef_ = std::move(orderRef);
         readyToCancel_ = done_ = ok_ = cancelAttempted_ = false;
         cancelResponseKnown_ = cancelSubmissionAccepted_ = canceledObserved_ = false;
-        tradedVolume_ = 0; reason_.clear(); order_ = {};
+        cancelRejected_ = false;
+        fillGoal_ = fillGoal;
+        acceptedObserved_ = filledObserved_ = false; residualUnknown_ = true;
+        orderTradedVolume_ = tradeCallbackVolume_ = unidentifiedTradeVolume_ = 0; tradeIds_.clear();
+        orderIdentityVerified_ = false; pendingTrades_.clear();
+        reason_.clear(); order_ = identifiers;
     }
     const std::string& orderRef() const { return orderRef_; }
 
     void insertResponse(CThostFtdcInputOrderField* input, CThostFtdcRspInfoField* info) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (input && !matches(input->OrderRef)) return;
-        if (info && info->ErrorID != 0) fail("OnRspOrderInsert rejected the order");
+        if (info && info->ErrorID != 0 && !acceptedObserved_) {
+            residualUnknown_ = false;
+            fail("OnRspOrderInsert rejected the order");
+        }
     }
     void insertError(CThostFtdcInputOrderField* input, CThostFtdcRspInfoField* info) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (input && !matches(input->OrderRef)) return;
+        if (acceptedObserved_) return;
+        residualUnknown_ = !info || info->ErrorID == 0;
         fail(info && info->ErrorID != 0 ? "OnErrRtnOrderInsert rejected the order"
                                         : "OnErrRtnOrderInsert without a nonzero error code");
     }
     void actionResponse(CThostFtdcInputOrderActionField* action, CThostFtdcRspInfoField* info) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (action && !matches(action->OrderRef)) return;
-        if (info && info->ErrorID != 0) fail("OnRspOrderAction rejected cancellation");
+        if (info && info->ErrorID != 0) {
+            cancelRejected_ = true;
+            fail("OnRspOrderAction rejected cancellation");
+            if (canceledObserved_ && !filledObserved_) canceled();
+        }
     }
     void actionError(CThostFtdcOrderActionField* action, CThostFtdcRspInfoField* info) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (action && !matches(action->OrderRef)) return;
+        cancelRejected_ = true;
         fail(info && info->ErrorID != 0 ? "OnErrRtnOrderAction rejected cancellation"
                                         : "OnErrRtnOrderAction without a nonzero error code");
+        if (canceledObserved_ && !filledObserved_) canceled();
     }
     void responseError(int request, CThostFtdcRspInfoField* info) {
         if (request != 4 && request != 5) return;
         std::lock_guard<std::mutex> lock(mutex_);
-        if (info && info->ErrorID != 0) fail("OnRspError for order request");
+        if (info && info->ErrorID != 0) {
+            if (request == 5) cancelRejected_ = true;
+            fail("OnRspError for order request");
+            if (request == 5 && canceledObserved_ && !filledObserved_) canceled();
+        }
     }
     void insertSubmitted(int rc) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (rc != 0) fail("order submission rejected; immediate_rc=" + std::to_string(rc));
+        if (rc != 0 && !acceptedObserved_) {
+            residualUnknown_ = false;
+            fail("order submission rejected; immediate_rc=" + std::to_string(rc));
+        }
     }
     void returnedOrder(CThostFtdcOrderField* order) {
         if (!order) return;
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!matches(order->OrderRef) || done_) return;
+        if (!matches(order->OrderRef)) return;
+        if (order_.FrontID != 0 && order_.FrontID != order->FrontID) return;
+        if (order_.SessionID != 0 && order_.SessionID != order->SessionID) return;
+        if (!textField(order_.InstrumentID).empty() && !textField(order->InstrumentID).empty() &&
+            textField(order_.InstrumentID) != textField(order->InstrumentID)) return;
+        if (!textField(order_.ExchangeID).empty() && !textField(order->ExchangeID).empty() &&
+            textField(order_.ExchangeID) != textField(order->ExchangeID)) return;
+        if (orderIdentityVerified_ && !trim(textField(order->OrderSysID)).empty() &&
+            trim(textField(order_.OrderSysID)) != trim(textField(order->OrderSysID))) return;
+        const auto identifiers = order_;
         order_ = *order;
-        tradedVolume_ = std::max(tradedVolume_, order->VolumeTraded);
+        if (order_.FrontID == 0) order_.FrontID = identifiers.FrontID;
+        if (order_.SessionID == 0) order_.SessionID = identifiers.SessionID;
+        if (textField(order_.InstrumentID).empty()) std::memcpy(order_.InstrumentID, identifiers.InstrumentID, sizeof(order_.InstrumentID));
+        if (textField(order_.ExchangeID).empty()) std::memcpy(order_.ExchangeID, identifiers.ExchangeID, sizeof(order_.ExchangeID));
+        if (textField(order_.OrderSysID).empty()) std::memcpy(order_.OrderSysID, identifiers.OrderSysID, sizeof(order_.OrderSysID));
+        if (!trim(textField(order->OrderSysID)).empty() && !trim(textField(order->ExchangeID)).empty()) {
+            orderIdentityVerified_ = true;
+            for (const auto& trade : pendingTrades_) verifiedTrade(trade);
+            pendingTrades_.clear();
+        }
+        orderTradedVolume_ = std::max(orderTradedVolume_, order->VolumeTraded);
+        if (order->OrderStatus == THOST_FTDC_OST_AllTraded || orderTradedVolume_ >= 1) {
+            orderTradedVolume_ = std::max(orderTradedVolume_, 1);
+            filled();
+            return;
+        }
+        if (filledObserved_) return;
         if (order->OrderSubmitStatus == THOST_FTDC_OSS_InsertRejected) {
+            residualUnknown_ = false;
             fail("order insert rejected by counter");
         } else if (order->OrderStatus == THOST_FTDC_OST_Canceled) {
             canceledObserved_ = true;
-            if (!cancelAttempted_) {
-                done_ = true; ok_ = false;
-                reason_ = "order canceled before this program submitted cancellation";
-            } else if (cancelResponseKnown_) {
-                done_ = true;
-                ok_ = cancelSubmissionAccepted_;
-                reason_ = ok_ ? "order accepted and remaining quantity canceled"
-                              : "order canceled but this program's cancellation submission was rejected";
-            }
-            cv_.notify_all();
-        } else if (order->OrderStatus == THOST_FTDC_OST_AllTraded) {
-            done_ = true; ok_ = false;
-            reason_ = "order fully traded before cancellation; financial effect occurred and cancel was not verified";
-            cv_.notify_all();
+            residualUnknown_ = false;
+            canceled();
         } else if (order->OrderStatus == THOST_FTDC_OST_PartTradedNotQueueing ||
                    order->OrderStatus == THOST_FTDC_OST_NoTradeNotQueueing) {
+            residualUnknown_ = false;
             fail("order is no longer queued and was not canceled by this program");
         } else if (order->OrderStatus == THOST_FTDC_OST_PartTradedQueueing ||
                    order->OrderStatus == THOST_FTDC_OST_NoTradeQueueing) {
-            readyToCancel_ = true;
+            if (done_ || canceledObserved_) return;
+            acceptedObserved_ = true; readyToCancel_ = true;
             cv_.notify_all();
         }
     }
     void returnedTrade(CThostFtdcTradeField* trade) {
         if (!trade) return;
         std::lock_guard<std::mutex> lock(mutex_);
-        if (matches(trade->OrderRef)) tradedVolume_ += trade->Volume;
+        if (!matches(trade->OrderRef) || trade->Volume <= 0) return;
+        if (!textField(order_.InstrumentID).empty() && !textField(trade->InstrumentID).empty() &&
+            textField(order_.InstrumentID) != textField(trade->InstrumentID)) return;
+        if (!textField(order_.ExchangeID).empty() && !textField(trade->ExchangeID).empty() &&
+            textField(order_.ExchangeID) != textField(trade->ExchangeID)) return;
+        if (trim(textField(trade->OrderSysID)).empty() || trim(textField(trade->ExchangeID)).empty()) return;
+        if (!orderIdentityVerified_) {
+            // 同账号其他会话可能复用 OrderRef。先暂存，关联成功前不能改变成交结果。
+            // 上限防止无关账户活动造成无限增长；ALL_TRADED 回报仍能独立确认成交。
+            if (pendingTrades_.size() < 64) pendingTrades_.push_back(*trade);
+            return;
+        }
+        verifiedTrade(*trade);
     }
     OrderResult waitUntilCancelableOrDone(int timeout) {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -851,9 +1129,15 @@ public:
             fail("order status timeout before a cancelable or terminal callback");
         return snapshot();
     }
-    bool beginCancellation() {
+    OrderResult waitForFill(int timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        // 排队不是结束条件：给予撮合一个有界窗口，超时交由主线程申请一次撤单。
+        cv_.wait_for(lock, std::chrono::seconds(timeout), [this] { return done_; });
+        return snapshot();
+    }
+    bool beginCancellation(bool allowWithoutQueueing = false) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (done_ || !readyToCancel_) return false;
+        if (done_ || cancelAttempted_ || (!readyToCancel_ && !allowWithoutQueueing)) return false;
         cancelAttempted_ = true;
         return true;
     }
@@ -866,16 +1150,16 @@ public:
         cancelResponseKnown_ = true;
         cancelSubmissionAccepted_ = rc == 0;
         if (rc != 0) {
+            cancelRejected_ = true;
             fail("cancellation submission rejected; immediate_rc=" + std::to_string(rc));
-        } else if (canceledObserved_ && !done_) {
-            done_ = true; ok_ = true; reason_ = "order accepted and remaining quantity canceled";
-            cv_.notify_all();
+        } else if (canceledObserved_ && !filledObserved_) {
+            canceled();
         }
     }
     OrderResult waitUntilDone(int timeout) {
         std::unique_lock<std::mutex> lock(mutex_);
         if (!cv_.wait_for(lock, std::chrono::seconds(timeout), [this] { return done_; }))
-            fail("cancellation result timeout; check the live order at the counter immediately");
+            fail("cancellation result timeout; residual order state UNKNOWN; check the counter immediately");
         return snapshot();
     }
 };
@@ -1088,55 +1372,87 @@ bool testBasicFunction(CThostFtdcTraderApi& api, const Config& c, const Options&
 
     const std::string tradingDay = trim(textField(login.login.TradingDay));
     DailyOrderCounter counter(dailyOrderStatePath(c), c.dailyMaxOrderCount, c);
-    const auto risk = counter.reserve(tradingDay);
+    CThostFtdcOrderField identifiers{};
+    field(identifiers.OrderRef, orderRef, "order_ref");
+    field(identifiers.InstrumentID, o.instrument, "instrument");
+    field(identifiers.ExchangeID, o.exchange, "exchange");
+    identifiers.FrontID = login.login.FrontID;
+    identifiers.SessionID = login.login.SessionID;
+    lifecycle.start(orderRef, o.orderGoal == "fill", identifiers);
+    auto request = order; // SDK 接口不是 const；缓冲在整个等待阶段保持有效。
+    const auto submitted = counter.submit(tradingDay, [&] {
+        log.write("BASIC LIVE_ORDER_START exactly_one_order=YES automatic_retry=NO automatic_reprice=NO");
+        return api.ReqOrderInsert(&request, 4);
+    });
+    const auto& risk = submitted.risk;
     log.write("RISK CHECK rule=daily_max_order_count configured_limit=" +
               std::to_string(risk.configuredLimit) +
               " submitted_before=" + std::to_string(risk.submittedBefore) +
               " submitted_after=" + std::to_string(risk.submittedAfter) +
               " trading_day=" + risk.tradingDay +
               " decision=" + (risk.allowed ? "ALLOW" : "BLOCK") +
-              " counting_rule=ReqOrderInsert_attempts state_file=" +
+              " blocked_rule=" + (risk.blockedRule.empty() ? "NONE" : risk.blockedRule) +
+              " check_timing=BEFORE_API counting_rule=ReqOrderInsert_attempts state_file=" +
               fs::absolute(dailyOrderStatePath(c)).string());
+    log.write("RISK CHECK rule=per_second_max_order_count configured_limit=" +
+              std::to_string(risk.perSecondLimit) +
+              " submitted_before=" + std::to_string(risk.secondBefore) +
+              " submitted_after=" + std::to_string(risk.secondAfter) +
+              " peak_per_second=" + std::to_string(risk.peakPerSecond) +
+              " window_ms=1000 window=ROLLING decision=" + (risk.allowed ? "ALLOW" : "BLOCK") +
+              " blocked_rule=" + (risk.blockedRule.empty() ? "NONE" : risk.blockedRule));
     if (!risk.allowed) {
-        log.write("RISK TRIGGER rule=daily_max_order_count decision=BLOCK api_call=NOT_SENT");
+        log.write("RISK TRIGGER rule=" + risk.blockedRule + " decision=BLOCK api_call=NOT_SENT");
         showRiskTriggerDialog(risk, false);
         log.write("BASIC RESULT status=FAIL strategy=PASS order=BLOCKED_BY_RISK cancel=NOT_RUN "
-                  "traded_volume=0 reason=daily maximum order count reached");
+                  "traded_volume=0 reason=" + risk.blockedRule + " reached");
         return false;
     }
-
-    lifecycle.start(orderRef);
-    log.write("BASIC LIVE_ORDER_START exactly_one_order=YES automatic_retry=NO automatic_reprice=NO");
-    auto request = order; // SDK 接口不是 const；缓冲在整个等待阶段保持有效。
-    const int insertRc = api.ReqOrderInsert(&request, 4);
+    const int insertRc = submitted.immediateRc;
+    if (!submitted.stateFinalized)
+        log.write("RISK STATE_FINALIZE_FAILED order_api=CALLED further_orders=BLOCKED reconcile_persisted_pending_state; continuing_order_cleanup");
     log.write("BASIC CALL ReqOrderInsert request_id=4 immediate_rc=" + std::to_string(insertRc) +
               " (submission only)");
     lifecycle.insertSubmitted(insertRc);
-    const OrderResult accepted = lifecycle.waitUntilCancelableOrDone(o.timeout);
-    if (accepted.done) {
-        log.write("BASIC RESULT status=FAIL strategy=PASS order=NOT_CANCELABLE cancel=NOT_RUN traded_volume=" +
-                  std::to_string(accepted.tradedVolume) + " reason=" + accepted.reason);
-        return false;
+    auto finish = [&](const OrderResult& result) {
+        const char* orderStatus = result.accepted ? "PASS" : result.residualUnknown ? "UNKNOWN" : "NOT_ACCEPTED";
+        const char* cancelStatus = result.cancelVerified ? "PASS" : result.cancelAttempted ? "FAIL" : "NOT_RUN";
+        log.write(std::string("BASIC RESULT status=") + (result.ok ? "PASS" : "FAIL") +
+                  " strategy=PASS order_goal=" + o.orderGoal + " order=" + orderStatus +
+                  " fill=" + (result.filled ? "PASS" : "NOT_FILLED") + " cancel=" + cancelStatus +
+                  " traded_volume=" + std::to_string(result.tradedVolume) +
+                  " residual_order=" + (result.residualUnknown ? "UNKNOWN" : "NONE") +
+                  " reason=" + result.reason);
+        if (result.residualUnknown)
+            log.write("BASIC OPERATOR_CHECK_REQUIRED order_ref=" + orderRef +
+                      " instrument=" + o.instrument + " exchange=" + o.exchange +
+                      " residual_order=UNKNOWN check_and_cancel_in_counter_terminal; no automatic retry");
+        return result.ok;
+    };
+    OrderResult accepted;
+    if (o.orderGoal == "fill") {
+        log.write("BASIC FILL_WAIT_START wait_seconds=" + std::to_string(o.fillWait) +
+                  " cancellation=AFTER_WAIT_IF_UNFILLED automatic_reprice=NO");
+        accepted = lifecycle.waitForFill(o.fillWait);
+        if (!accepted.done)
+            log.write("BASIC FILL_WAIT_EXPIRED cancel_remaining=YES cancel_attempts_max=1");
+    } else {
+        accepted = lifecycle.waitUntilCancelableOrDone(o.timeout);
     }
+    if (accepted.done) return finish(accepted);
 
-    auto action = basicCancelRequest(c, o, accepted.order, orderRef);
     // 必须在调用 SDK 前原子确认订单仍可撤并设置标志，兼容排队后立刻成交和调用期间回调。
-    if (!lifecycle.beginCancellation()) {
-        const OrderResult changed = lifecycle.current();
-        log.write("BASIC RESULT status=FAIL strategy=PASS order=NOT_CANCELABLE cancel=NOT_RUN traded_volume=" +
-                  std::to_string(changed.tradedVolume) + " reason=" + changed.reason);
-        return false;
-    }
+    // 成交等待超时即使没有排队回报，也用登录的 FrontID/SessionID + OrderRef 尝试一次撤单。
+    if (!lifecycle.beginCancellation(o.orderGoal == "fill")) return finish(lifecycle.current());
+    const OrderResult beforeCancel = lifecycle.current();
+    if (beforeCancel.done) return finish(beforeCancel);
+    auto action = basicCancelRequest(c, o, beforeCancel.order, orderRef);
     const int cancelRc = api.ReqOrderAction(&action, 5);
     log.write("BASIC CALL ReqOrderAction request_id=5 immediate_rc=" + std::to_string(cancelRc) +
-              " order_ref=" + orderRef + " order_sys_id=" + textField(accepted.order.OrderSysID) +
+              " order_ref=" + orderRef + " order_sys_id=" + textField(beforeCancel.order.OrderSysID) +
               " (submission only)");
     lifecycle.cancellationSubmitted(cancelRc);
-    const OrderResult final = lifecycle.waitUntilDone(o.timeout);
-    log.write(std::string("BASIC RESULT status=") + (final.ok ? "PASS" : "FAIL") +
-              " strategy=PASS order=PASS cancel=" + (final.ok ? "PASS" : "FAIL") +
-              " traded_volume=" + std::to_string(final.tradedVolume) + " reason=" + final.reason);
-    return final.ok;
+    return finish(lifecycle.waitUntilDone(o.timeout));
 }
 bool testTrader(const Config& c, const Secrets& s, const Options& o, const fs::path& flow, Logger& log) {
     State state;
@@ -1216,14 +1532,18 @@ int main(int argc, char** argv) {
                          "       [--timeout 1..300] [--skip-query] [--version] [--help]\n"
                          "       --mode trader --test basic --instrument ID --exchange SSE|SZSE\n"
                          "       --direction buy|sell --offset open|close --price PRICE\n"
+                         "       [--order-goal cancel|fill] [--fill-wait 1..300]\n"
                          "       [--send-order --confirm SEND_ONE_ORDER]\n"
                          "       --test risk --risk-action settings\n"
                          "       --test risk --risk-action trigger --confirm TRIGGER_DAILY_ORDER_LIMIT\n"
+                         "       --test risk --risk-action trigger-second --confirm TRIGGER_SECOND_ORDER_LIMIT\n"
                          "Default: all, config/connection.ini, 30 seconds PER STAGE, account query enabled.\n"
                          "Credentials: nonempty local INI > main INI > CTP_PASSWORD / CTP_AUTH_CODE > hidden prompts.\n"
                          "config/connection.local.ini is loaded automatically when using the default config.\n"
                          "Basic test defaults to dry-run. --send-order transmits one GFD limit order with volume=1\n"
-                         "and attempts to cancel it; it may trade before cancellation. No automatic retry/reprice.\n"
+                         "Default order-goal=cancel cancels on queueing; the order may trade before cancellation.\n"
+                         "order-goal=fill waits up to fill-wait seconds (default 10), then attempts one cancellation.\n"
+                         "Fill mode passes only on fill evidence; timeout or unknown cleanup fails. No retry/reprice.\n"
                          "Risk evidence mode displays screenshot dialogs without credentials, network, or order calls.\n"
                          "MD-only mode does not need CTP_AUTH_CODE. No password-update operation.\n";
             return 0;
@@ -1232,8 +1552,9 @@ int main(int argc, char** argv) {
         if (options.version) return 0; // help/version 不读配置、不索取密码、不连接网络。
         const Config config = readConfig(options.config, secret);
         if (options.test == "risk") return runRiskEvidence(config, options, secret) ? 0 : 1;
-        if (options.test == "basic" && options.sendOrder && config.dailyMaxOrderCount < 1)
-            throw std::runtime_error("Live order transmission requires daily_max_order_count in config/connection.local.ini.");
+        if (options.test == "basic" && options.sendOrder &&
+            (config.dailyMaxOrderCount < 1 || config.perSecondMaxOrderCount < 1))
+            throw std::runtime_error("Live order transmission requires daily_max_order_count and per_second_max_order_count in config/connection.local.ini.");
         secret.password = getSecret(secret.password, "CTP_PASSWORD", "Trading password (hidden): ");
         if (options.mode != "md") secret.auth = getSecret(secret.auth, "CTP_AUTH_CODE", "Authentication code (hidden): ");
         // 先校验所有固定长度字段，避免连上前置后才发现输入被截断或无效。
@@ -1259,6 +1580,9 @@ int main(int argc, char** argv) {
         log.write("RISK CONFIG rule=daily_max_order_count configured_limit=" +
                   (config.dailyMaxOrderCount > 0 ? std::to_string(config.dailyMaxOrderCount) : "NOT_CONFIGURED") +
                   " unit=orders counting_rule=ReqOrderInsert_attempts period=trading_day");
+        log.write("RISK CONFIG rule=per_second_max_order_count configured_limit=" +
+                  (config.perSecondMaxOrderCount > 0 ? std::to_string(config.perSecondMaxOrderCount) : "NOT_CONFIGURED") +
+                  " unit=orders_per_second window_ms=1000 window=ROLLING counting_rule=ReqOrderInsert_attempts");
         log.write("FRONTS trader=" + config.trader + " md=" + config.md);
         log.write("TIME timestamps=host_local_wall_clock; elapsed_timeouts=monotonic; check local clock before evidence capture");
         const std::string admin = administratorStatus();
@@ -1266,7 +1590,9 @@ int main(int argc, char** argv) {
         if (admin != "YES") log.write("NOTICE formal evaluation login requires an elevated Windows console on a physical machine");
         if (options.test == "basic") {
             log.write(std::string("SCOPE connect/auth/login/read-only-account-query; single-shot limit strategy; ") +
-                      (options.sendOrder ? "exactly one order with volume=1 and cancellation enabled"
+                      (options.sendOrder ? "exactly one order with volume=1; order_goal=" + options.orderGoal +
+                                           (options.orderGoal == "fill" ? "; bounded fill wait, cancel remainder on timeout"
+                                                                         : "; cancel on queueing")
                                          : "dry-run only; no order transmitted"));
         } else {
             log.write("SCOPE connect/auth/login/read-only-account-query; no market subscription, order, cancel, settlement or password change");

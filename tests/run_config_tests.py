@@ -74,6 +74,43 @@ def windows_credential_branch_test(root, build, compiler):
     subprocess.run([str(binary)], stdin=subprocess.DEVNULL, check=True)
 
 
+def windows_risk_dialog_test(root, build, compiler):
+    text = (root / "src" / "main.cpp").read_text(encoding="utf-8")
+    start = text.index("struct DailyOrderRiskDecision {")
+    decision = text[start:text.index("\n};", start) + 3]
+    start = text.index("void showRiskSettingsDialog(")
+    settings = text[start:text.index("\nvoid showRiskTriggerDialog(", start)]
+    start = text.index("void showRiskTriggerDialog(const DailyOrderRiskDecision& decision, bool selfTest) {")
+    trigger = text[start:text.index("\nenum class Stage", start)]
+    (build / "risk_dialogs_under_test.inc").write_text(
+        decision + "\n" + settings + "\n" + trigger, encoding="utf-8")
+    source = root / "tests" / "windows_risk_dialog_test.cpp"
+    binary = build / ("windows_risk_dialogs.exe" if os.name == "nt" else "windows_risk_dialogs")
+    if Path(compiler).name.lower() in {"cl", "cl.exe"}:
+        command = [compiler, "/nologo", "/std:c++17", "/EHsc", "/utf-8", "/W4",
+                   f"/I{build}", str(source), f"/Fe:{binary}"]
+    else:
+        command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-pedantic",
+                   "-I", str(build), str(source), "-o", str(binary)]
+    subprocess.run(command, cwd=build, check=True)
+    subprocess.run([str(binary)], stdin=subprocess.DEVNULL, check=True)
+
+
+def compile_offline_test(root, build, compiler, name):
+    source = root / "tests" / f"{name}.cpp"
+    binary = build / (f"{name}.exe" if os.name == "nt" else name)
+    includes = root / "sdk" / "include"
+    if Path(compiler).name.lower() in {"cl", "cl.exe"}:
+        command = [compiler, "/nologo", "/std:c++17", "/EHsc", "/utf-8", "/Gy", "/Gw", "/O2",
+                   f"/I{includes}", str(source), f"/Fe:{binary}", "/link", "/OPT:REF",
+                   "advapi32.lib", "user32.lib"]
+    else:
+        command = [compiler, "-std=c++17", "-O1", "-pthread", "-ffunction-sections", "-fdata-sections",
+                   "-isystem", str(includes), str(source), "-Wl,--gc-sections", "-o", str(binary)]
+    subprocess.run(command, cwd=build, check=True)
+    return binary
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     compiler = os.environ.get("CXX") or ("cl" if os.name == "nt" else "g++")
@@ -81,19 +118,15 @@ def main():
         raise SystemExit("C++ compiler unavailable; set CXX or use an x64 Native Tools prompt.")
     with tempfile.TemporaryDirectory(prefix="ctpstock-config-tests-") as temporary:
         build = Path(temporary)
-        binary = build / ("config_tests.exe" if os.name == "nt" else "config_tests")
-        source = root / "tests" / "config_credentials_test.cpp"
-        includes = root / "sdk" / "include"
-        if Path(compiler).name.lower() in {"cl", "cl.exe"}:
-            command = [compiler, "/nologo", "/std:c++17", "/EHsc", "/utf-8", "/Gy", "/Gw", "/O2",
-                       f"/I{includes}", str(source), f"/Fe:{binary}", "/link", "/OPT:REF"]
-        else:
-            command = [compiler, "-std=c++17", "-O1", "-pthread", "-ffunction-sections", "-fdata-sections",
-                       "-I", str(includes), str(source), "-Wl,--gc-sections", "-o", str(binary)]
-        subprocess.run(command, cwd=build, check=True)
+        binary = compile_offline_test(root, build, compiler, "config_credentials_test")
         subprocess.run([str(binary), str(build / "fixtures")], stdin=subprocess.DEVNULL, check=True)
         prompt_test(binary)
         windows_credential_branch_test(root, build, compiler)
+        windows_risk_dialog_test(root, build, compiler)
+        for name in ("order_rate_test", "order_fill_test"):
+            binary = compile_offline_test(root, build, compiler, name)
+            subprocess.run([str(binary), str(build / (name + "_fixtures"))],
+                           stdin=subprocess.DEVNULL, check=True)
     print("Offline tests complete. Live login and Windows console behavior are separate checks.")
 
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(CTPStockConnectivity VERSION 0.3.0 LANGUAGES CXX)
+project(CTPStockConnectivity VERSION 0.4.0 LANGUAGES CXX)
 if(NOT WIN32 OR NOT MSVC)
   message(FATAL_ERROR "This deliverable targets Windows x64 MSVC and the supplied stock-options DLLs.")
 endif()

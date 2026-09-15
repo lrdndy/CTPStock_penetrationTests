@@ -230,6 +230,11 @@ int main(int argc, char** argv) {
             const auto trigger = parse({"--test", "risk", "--risk-action", "trigger",
                                         "--confirm", "TRIGGER_DAILY_ORDER_LIMIT"});
             require(trigger.riskAction == "trigger", "Risk trigger action did not parse");
+            const auto second = parse({"--test", "risk", "--risk-action", "trigger-second",
+                                       "--confirm", "TRIGGER_SECOND_ORDER_LIMIT"});
+            require(second.riskAction == "trigger-second", "Per-second trigger action did not parse");
+            rejects([] { (void)parse({"--test", "risk", "--risk-action", "trigger-second",
+                                     "--confirm", "TRIGGER_DAILY_ORDER_LIMIT"}); }, "requires --confirm");
             rejects([] { (void)parse({"--test", "risk", "--risk-action", "trigger"}); },
                     "requires --confirm");
             rejects([] { (void)parse({"--test", "risk", "--risk-action", "settings",

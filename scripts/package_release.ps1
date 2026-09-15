@@ -43,14 +43,24 @@ change to this package directory, then run:
 
 For the guarded basic-function test, read docs/CODE_GUIDE.md and run
 run_basic_windows.bat with an instrument, exchange, direction, offset and price.
+The default --order-goal cancel cancels after a queueing response. To test one
+fill, add --order-goal fill --fill-wait 10 (allowed wait: 1..300 seconds).
+A full fill passes the fill goal. A timeout attempts at most one cancellation;
+an unfilled canceled order fails the fill goal. Check the trading terminal if
+the result reports residual_order=UNKNOWN. No automatic retries or repricing.
 
-For daily maximum order-count evidence, configure the exact filed threshold,
-then use run_risk_windows.bat settings and run_risk_windows.bat trigger.
-The risk screenshot self-test does not connect or send an order.
+For daily and per-second order-count evidence, configure both exact filed
+thresholds, then use run_risk_windows.bat settings to display both values.
+Use run_risk_windows.bat trigger for daily evidence and trigger-second for
+per-second evidence. Both are labeled offline threshold-injection tests;
+neither connects, sends an order, nor changes real counters. They do not
+demonstrate actual order throughput. Do not mass-submit orders for screenshots.
 
 For one-time setup, copy config/connection.local.ini.example to
 config/connection.local.ini and fill password=, auth_code=, and the exact filed
-daily_max_order_count= there.
+daily_max_order_count= and per_second_max_order_count= there (1..999999999).
+Live basic orders and risk evidence require both thresholds. Ordinary
+connectivity and basic dry-run tests can run without configured thresholds.
 Future runs load those values automatically without prompting.
 The runtime package never includes credentials from the packaging machine.
 Without configured values, CTP_PASSWORD / CTP_AUTH_CODE and hidden prompts
@@ -59,6 +69,15 @@ The config/connection.ini contains account identifiers and evaluation fronts.
 Read docs/CODE_GUIDE.md and docs/REPORT_ROADMAP.md for scope and next steps.
 The default connectivity test sends no orders. The basic test is dry-run unless
 --send-order and --confirm SEND_ONE_ORDER are both present; that mode can trade.
+Each run sends at most one order of one lot and attempts at most one cancel.
+Daily and rolling-1000ms limits jointly guard each ReqOrderInsert attempt,
+including immediate API errors and later counter rejections. Cancellations
+are not counted or rate-limited. A blocked attempt consumes neither limit.
+Counters persist across processes and runs for this machine, account and
+project directory; other software, machines and copies are not aggregated.
+The state directory also records recent uptime timestamps and the observed
+per-second peak. Incomplete submission state blocks future orders. Preserve
+existing state when updating in place; do not clear it to bypass a limit.
 No password changes or settlement confirmations are sent.
 The logs and flow directories will be created during the run.
 
