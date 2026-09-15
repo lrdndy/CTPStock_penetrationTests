@@ -1,6 +1,7 @@
 /build*/
 /logs/
 /flow/
+/state/
 /dist/
 *.local.ini
 *.log

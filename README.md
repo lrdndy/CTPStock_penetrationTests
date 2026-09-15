@@ -1,8 +1,8 @@
 # 股票期权 API 连接与基础功能测试
 
-本项目用于附件六股票期权接入测试：在 Windows 64 位实体机上验证交易前置连接、客户端认证、账户登录、资金查询，以及行情前置连接和登录；还提供受显式开关保护的“单次限价报单后自动撤单”基础功能测试。源码版本为 `0.2.2`，绑定个股期权 SDK `v3.7.5_CP_20251125`。公开仓库包含源码、头文件、LIB 和错误码文件；两只原厂运行时 DLL 需从用户持有的 SDK 压缩包复制到本地，再在 Windows 上编译生成 EXE。
+本项目用于附件六股票期权接入测试：在 Windows 64 位实体机上验证交易前置连接、客户端认证、账户登录、资金查询，以及行情前置连接和登录；还提供受显式开关保护的“单次限价报单后自动撤单”基础功能测试，以及可按报备表配置的每日最大报单量风控。源码版本为 `0.3.0`，绑定个股期权 SDK `v3.7.5_CP_20251125`。公开仓库包含源码、头文件、LIB 和错误码文件；两只原厂运行时 DLL 需从用户持有的 SDK 压缩包复制到本地，再在 Windows 上编译生成 EXE。
 
-默认 `connectivity` 测试不报单。`basic` 测试实现了一项真实但刻意受限的策略：按命令行给出的合约、方向、开平和限价生成一笔报单数量为 1 的 GFD 限价委托；默认仅演练请求构造，只有同时给出 `--send-order --confirm SEND_ONE_ORDER` 才向柜台发送，并在收到排队状态后自动撤单。它不订阅行情、不自动选价、不追价、不重试，也不在成交后自动反向平仓。程序仍没有密码修改、结算确认或正式报备风控功能。附件六后续范围见 [REPORT_ROADMAP.md](docs/REPORT_ROADMAP.md)。
+默认 `connectivity` 测试不报单。`basic` 测试实现了一项真实但刻意受限的策略：按命令行给出的合约、方向、开平和限价生成一笔报单数量为 1 的 GFD 限价委托；默认仅演练请求构造，只有同时给出 `--send-order --confirm SEND_ONE_ORDER` 才向柜台发送，并在收到排队状态后自动撤单。它不订阅行情、不自动选价、不追价、不重试，也不在成交后自动反向平仓。每日限额作用在真实 `ReqOrderInsert` 之前；每秒限额和异常价格检查尚未实现。附件六后续范围见 [REPORT_ROADMAP.md](docs/REPORT_ROADMAP.md)。
 
 当前交付不是已通过的正式测试报告。实际柜台登录结果、Windows 编译与运行结果，以你的实体机执行结果为准；没有预先生成或冒充成功的截图和录屏。代码说明见 [CODE_GUIDE.md](docs/CODE_GUIDE.md)，离线验证范围见 [VALIDATION.md](docs/VALIDATION.md)。
 
@@ -65,8 +65,9 @@ notepad config\connection.local.ini
 | app_id | client_shunjingsf_v1.0.0 | 邮件中的 APPID 原文 |
 | trader_front | tcp://101.226.254.157:32205 | 交易评测前置 |
 | md_front | tcp://101.226.254.157:32213 | 行情评测前置 |
+| daily_max_order_count | 空（必须本地填写） | 报备表的每日最大报单量 |
 
-AppID 中的 `v1.0.0` 是已申请的标识组成部分，不能因为样例源码版本是 `0.2.2` 就随意修改。投资者代码若与登录账号不同，应按中信提供的值修改 `investor_id`。程序只允许上述评测前置和 BrokerID，不支持将配置直接切到生产环境。
+AppID 中的 `v1.0.0` 是已申请的标识组成部分，不能因为样例源码版本是 `0.3.0` 就随意修改。投资者代码若与登录账号不同，应按中信提供的值修改 `investor_id`。程序只允许上述评测前置和 BrokerID，不支持将配置直接切到生产环境。
 
 `config/connection.local.ini` 用来保存本机凭据，内容如下（将占位文字换成真实值）：
 
@@ -74,6 +75,9 @@ AppID 中的 `v1.0.0` 是已申请的标识组成部分，不能因为样例源�
 [credentials]
 password=填写交易密码
 auth_code=填写认证码
+
+[risk]
+daily_max_order_count=填写报备表整数
 ```
 
 这个仓库为公开仓库，只提交空凭据模板；真实本地文件已被 `.gitignore` 的 `*.local.ini` 规则排除。文件内容以明文保存在你的电脑，不会由本程序打印到日志。请用 UTF-8 保存，不要给值加引号或在值后面追加注释：`#`、`;`、`=` 在值中按原字符读取，值两端的空白会被去掉。
@@ -100,6 +104,26 @@ auth_code=填写认证码
 
 默认每一步等待 30 秒，整个程序可能经历多个步骤，因此总用时不等于 30 秒。程序不会在失败后自动重试认证或登录。`all` 顺序运行交易和行情链路，具体执行与返回状态以日志为准。
 
+## 每日最大报单量风控与截图
+
+先在 `config\connection.local.ini` 的 `[risk]` 中把 `daily_max_order_count` 填为报备表上的正式整数。程序不内置或猜测该阈值；值为空时，任何实发测试会在连接前拒绝启动。修改 INI 后不需重新编译。
+
+用下面两条命令生成报告要求的两张截图：
+
+```powershell
+# 1. 风控设置截图：弹窗显示报备阈值及计数口径
+.\run_risk_windows.bat settings
+
+# 2. 风控触发截图：使用同一判断函数，将自测计数注入到阈值并证明本地拦截
+.\run_risk_windows.bat trigger
+```
+
+弹窗会一直保留到点击“确定”，可连同 PowerShell 窗口一起截图。`trigger` 是安全自测：不读写真实计数文件、不索取凭据、不连网、不调用报单 API；弹窗明确标注“测试触发：是（未发送真实报单）”，日志同时记录 `api_call=NOT_SENT`。因此它证明本地风控判断与提示能正常触发，不应写成“已实际发送 N 笔报单”。
+
+实发时，每次准备调用 `ReqOrderInsert` 计 1 笔，包括 SDK 立即返回失败或柜台后续拒单的尝试；撤单不计入。计数先保存到 `state\daily_order_count_<BrokerID>_<UserID>.ini`，再调用 SDK；重启程序后仍继续累计，登录返回的交易日改变时归零。当前计数已等于阈值时，程序在 SDK 调用前拦截、弹出中文提示并以失败退出。状态文件损坏、无法加锁或无法写入时也会默认拒绝报单。
+
+该计数范围是“本项目目录内、当前 BrokerID 与 UserID”，无法看到其他软件或其他项目副本发出的报单。正式报备口径若要求多程序合并计数，必须先调整实现，不能直接用本截图代替。不要为了截图而实际发送大量委托。
+
 ## 1.1 基础功能测试
 
 基础功能测试包含两项真实软件能力：
@@ -120,7 +144,7 @@ auth_code=填写认证码
 BASIC RESULT status=PASS strategy=PASS order_fields=PASS transmission=NOT_REQUESTED cancel=NOT_RUN
 ```
 
-确认使用评测账号、有效测试合约、正确价格和测试时段后，才运行实发模式：
+确认使用评测账号、有效测试合约、正确价格、测试时段，且已配置与报备表一致的 `daily_max_order_count` 后，才运行实发模式：
 
 ```powershell
 .\run_basic_windows.bat --instrument 合约代码 --exchange SSE --direction buy --offset open --price 价格 --send-order --confirm SEND_ONE_ORDER --timeout 60
@@ -142,7 +166,7 @@ BASIC RESULT status=PASS strategy=PASS order_fields=PASS transmission=NOT_REQUES
 
 上交所和深交所应分别使用各自真实可用合约执行并保存证据。登录或交易成功后，按券商要求在当天提供准确时间段供后台核验。
 
-配置文件中的凭据优先于进程环境变量。需要改密码或认证码时，编辑 `config/connection.local.ini` 并重新运行即可；修改配置本身不需要重新编译。升级到本版本的源码后仍需先重新编译一次。v0.1.3 的行情登录修复已由用户在 Windows 实机验证；v0.2.0 新增的基础报单功能尚未在维护端执行 Windows 构建或柜台实发，必须以你的本机真实日志为准。
+配置文件中的凭据优先于进程环境变量。需要改密码、认证码或每日阈值时，编辑 `config/connection.local.ini` 并重新运行即可；修改配置本身不需要重新编译。升级到本版本的源码后仍需先重新编译一次。v0.1.3 的行情登录修复和 v0.2.2 的中文回报显示已由用户在 Windows 实机验证；2026-09-15 用户日志也记录了一次 SSE 合约报单接受、进入排队后成功撤单。v0.3.0 的 Windows 风控弹窗必须以你拉取后的本机构建和现场截图为准。
 
 ## 怎么判断结果
 
@@ -211,6 +235,8 @@ Windows 编译成功后，可以制作此阶段运行包：
 | build_windows.bat | 自动查找 Visual Studio 并编译 |
 | run_windows.bat | 设置工作目录与控制台编码后启动 |
 | run_basic_windows.bat | 选择 `--mode trader --test basic` 的便捷入口；默认仍是 dry-run |
+| run_risk_windows.bat | 显示每日最大报单量设置，或执行不发单的风控触发自测 |
+| state | 按交易日保存当前账号已尝试报单数；本地生成且不提交 Git |
 | CMakeLists.txt | 已安装 CMake 时可选的构建入口 |
 | scripts/collect_environment.ps1 | 只读采集本机环境证据 |
 | scripts/package_release.ps1 | 生成运行快照和哈希值 |
@@ -227,7 +253,7 @@ cmake --build build-cmake
 .\build-cmake\bin\ctp_stock_connect.exe --config config\connection.ini --mode all
 ```
 
-当前基础功能只覆盖单次限价报单和自动撤单策略；有效合约行情订阅、委托/成交/持仓查询展示及正式风控仍需继续实现。每日/每秒最大报单阈值以报备表为准，目前尚未提供，不能自行填一个数作为正式验收值。
+当前基础功能覆盖单次限价报单和自动撤单策略，并已实现可配置、持久计数和截图自测的每日最大报单量风控。有效合约行情订阅、委托/成交/持仓查询展示、每秒最大报单量及异常价格检查仍需继续实现。正式每日阈值必须以报备表为准，不能自行填一个数作为正式验收值。
 
 ## 构建依据
 

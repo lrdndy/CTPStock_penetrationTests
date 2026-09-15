@@ -5,3 +5,7 @@
 [credentials]
 password=
 auth_code=
+
+[risk]
+# Required for live orders and risk screenshots. Must exactly match the filed value.
+daily_max_order_count=

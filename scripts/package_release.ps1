@@ -29,6 +29,7 @@ Copy-Item -LiteralPath (Join-Path $ctpRoot 'config\connection.local.ini.example'
 Copy-Item -LiteralPath (Join-Path $ctpRoot 'docs') -Destination $ctpStage -Recurse
 Copy-Item -LiteralPath (Join-Path $ctpRoot 'run_windows.bat') -Destination $ctpStage
 Copy-Item -LiteralPath (Join-Path $ctpRoot 'run_basic_windows.bat') -Destination $ctpStage
+Copy-Item -LiteralPath (Join-Path $ctpRoot 'run_risk_windows.bat') -Destination $ctpStage
 $ctpRuntimeReadme = @'
 # CTPStockConnectivity runtime snapshot
 
@@ -43,8 +44,13 @@ change to this package directory, then run:
 For the guarded basic-function test, read docs/CODE_GUIDE.md and run
 run_basic_windows.bat with an instrument, exchange, direction, offset and price.
 
+For daily maximum order-count evidence, configure the exact filed threshold,
+then use run_risk_windows.bat settings and run_risk_windows.bat trigger.
+The risk screenshot self-test does not connect or send an order.
+
 For one-time setup, copy config/connection.local.ini.example to
-config/connection.local.ini and fill password= and auth_code= there.
+config/connection.local.ini and fill password=, auth_code=, and the exact filed
+daily_max_order_count= there.
 Future runs load those values automatically without prompting.
 The runtime package never includes credentials from the packaging machine.
 Without configured values, CTP_PASSWORD / CTP_AUTH_CODE and hidden prompts

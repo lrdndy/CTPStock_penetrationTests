@@ -19,7 +19,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <type_traits>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -34,7 +36,7 @@
 using namespace ctp_sopt;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock; // 超时用单调时钟，避免系统校时影响等待时间。
-constexpr const char* kVersion = "v0.2.2";
+constexpr const char* kVersion = "v0.3.0";
 constexpr const char* kTraderFront = "tcp://101.226.254.157:32205";
 constexpr const char* kMdFront = "tcp://101.226.254.157:32213";
 
@@ -42,10 +44,11 @@ struct Config {
     std::string broker = "1000", user = "887120202987", investor;
     std::string trader = kTraderFront, md = kMdFront;
     std::string app = "client_shunjingsf_v1.0.0"; // 券商分配的 AppID，独立于本程序版本。
+    int dailyMaxOrderCount = 0; // 0 表示尚未按报备表配置；实发报单将拒绝启动。
 };
 struct Options {
     std::string mode = "all", config = "config/connection.ini";
-    std::string test = "connectivity", instrument, exchange, direction, offset, confirmation;
+    std::string test = "connectivity", instrument, exchange, direction, offset, confirmation, riskAction;
     double price = 0.0;
     int timeout = 30;
     bool skipQuery = false, sendOrder = false, help = false, version = false;
@@ -66,6 +69,14 @@ std::string trim(std::string s) {
     const auto first = s.find_first_not_of(" \t\r\n");
     return first == std::string::npos ? "" : s.substr(first, s.find_last_not_of(" \t\r\n") - first + 1);
 }
+int parseDailyMaxOrderCount(const std::string& value) {
+    if (value.empty() || value.size() > 9 || value.find_first_not_of("0123456789") != std::string::npos)
+        throw std::runtime_error("daily_max_order_count must be an integer from 1 to 999999999.");
+    const auto parsed = std::stoll(value);
+    if (parsed < 1 || parsed > 999999999)
+        throw std::runtime_error("daily_max_order_count must be an integer from 1 to 999999999.");
+    return static_cast<int>(parsed);
+}
 Options parseOptions(int argc, char** argv) {
     Options o;
     for (int i = 1; i < argc; ++i) {
@@ -76,7 +87,7 @@ Options parseOptions(int argc, char** argv) {
         if (arg == "--send-order") { o.sendOrder = true; continue; }
         if (arg != "--mode" && arg != "--config" && arg != "--timeout" && arg != "--test" &&
             arg != "--instrument" && arg != "--exchange" && arg != "--direction" &&
-            arg != "--offset" && arg != "--price" && arg != "--confirm")
+            arg != "--offset" && arg != "--price" && arg != "--confirm" && arg != "--risk-action")
             throw std::runtime_error("Unknown option; use --help.");
         if (++i == argc) throw std::runtime_error("Missing option value; use --help.");
         std::string value = argv[i];
@@ -93,6 +104,7 @@ Options parseOptions(int argc, char** argv) {
         else if (arg == "--direction") o.direction = value;
         else if (arg == "--offset") o.offset = value;
         else if (arg == "--confirm") o.confirmation = value;
+        else if (arg == "--risk-action") o.riskAction = value;
         else if (arg == "--price") {
             std::size_t used = 0;
             try { o.price = std::stod(value, &used); }
@@ -103,13 +115,13 @@ Options parseOptions(int argc, char** argv) {
     }
     if (o.mode != "all" && o.mode != "trader" && o.mode != "md")
         throw std::runtime_error("--mode must be trader, md, or all.");
-    if (o.test != "connectivity" && o.test != "basic")
-        throw std::runtime_error("--test must be connectivity or basic.");
+    if (o.test != "connectivity" && o.test != "basic" && o.test != "risk")
+        throw std::runtime_error("--test must be connectivity, basic, or risk.");
     if (o.test == "connectivity") {
         if (o.sendOrder || !o.instrument.empty() || !o.exchange.empty() || !o.direction.empty() ||
-            !o.offset.empty() || o.price != 0.0 || !o.confirmation.empty())
+            !o.offset.empty() || o.price != 0.0 || !o.confirmation.empty() || !o.riskAction.empty())
             throw std::runtime_error("Order options require --test basic.");
-    } else {
+    } else if (o.test == "basic") {
         if (o.mode != "trader") throw std::runtime_error("--test basic requires --mode trader.");
         if (o.instrument.empty() || o.exchange.empty() || o.direction.empty() || o.offset.empty() || o.price <= 0.0)
             throw std::runtime_error("--test basic requires --instrument, --exchange, --direction, --offset, and --price.");
@@ -125,6 +137,17 @@ Options parseOptions(int argc, char** argv) {
             throw std::runtime_error("--confirm is valid only with --send-order.");
         if (o.sendOrder && o.skipQuery)
             throw std::runtime_error("Live basic test does not allow --skip-query.");
+        if (!o.riskAction.empty()) throw std::runtime_error("--risk-action requires --test risk.");
+    } else {
+        if (o.riskAction != "settings" && o.riskAction != "trigger")
+            throw std::runtime_error("--test risk requires --risk-action settings or trigger.");
+        if (o.sendOrder || o.skipQuery || !o.instrument.empty() || !o.exchange.empty() ||
+            !o.direction.empty() || !o.offset.empty() || o.price != 0.0)
+            throw std::runtime_error("Risk evidence mode does not accept connectivity or order options.");
+        if (o.riskAction == "trigger" && o.confirmation != "TRIGGER_DAILY_ORDER_LIMIT")
+            throw std::runtime_error("Risk trigger self-test requires --confirm TRIGGER_DAILY_ORDER_LIMIT.");
+        if (o.riskAction == "settings" && !o.confirmation.empty())
+            throw std::runtime_error("Risk settings display does not accept --confirm.");
     }
     return o;
 }
@@ -139,7 +162,7 @@ void readConfigFile(const fs::path& path, Config& c, Secrets& secret) {
         if (number == 1 && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
         line = trim(line);
         if (line.empty() || line[0] == '#' || line[0] == ';') continue;
-        if (line == "[connection]" || line == "[credentials]") continue;
+        if (line == "[connection]" || line == "[credentials]" || line == "[risk]") continue;
         auto eq = line.find('=');
         if (eq == std::string::npos) throw std::runtime_error("Invalid INI syntax at line " + std::to_string(number));
         std::string key = trim(line.substr(0, eq)), value = trim(line.substr(eq + 1));
@@ -150,6 +173,9 @@ void readConfigFile(const fs::path& path, Config& c, Secrets& secret) {
         else if (key == "trader_front") c.trader = value;
         else if (key == "md_front") c.md = value;
         else if (key == "app_id") c.app = value;
+        else if (key == "daily_max_order_count") {
+            if (!value.empty()) c.dailyMaxOrderCount = parseDailyMaxOrderCount(value);
+        }
         // 凭据不放进会被日志输出的 Config；空值表示继续使用其他来源。
         else if (key == "password") { if (!value.empty()) secret.password = value; }
         else if (key == "auth_code") { if (!value.empty()) secret.auth = value; }
@@ -355,6 +381,251 @@ public:
         if (!file_) throw std::runtime_error("Writing run log failed; test stopped.");
     }
 };
+
+struct DailyOrderRiskDecision {
+    bool allowed = false;
+    int configuredLimit = 0;
+    int submittedBefore = 0;
+    int submittedAfter = 0;
+    std::string tradingDay;
+};
+DailyOrderRiskDecision evaluateDailyOrderRisk(int configuredLimit, int submittedBefore,
+                                              const std::string& tradingDay) {
+    if (configuredLimit < 1 || submittedBefore < 0)
+        throw std::runtime_error("Invalid daily order risk-control state.");
+    DailyOrderRiskDecision result;
+    result.allowed = submittedBefore < configuredLimit;
+    result.configuredLimit = configuredLimit;
+    result.submittedBefore = submittedBefore;
+    result.submittedAfter = submittedBefore + (result.allowed ? 1 : 0);
+    result.tradingDay = tradingDay;
+    return result;
+}
+bool validTradingDay(const std::string& value) {
+    return value.size() == 8 && value.find_first_not_of("0123456789") == std::string::npos;
+}
+unsigned long processIdNumber() {
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return static_cast<unsigned long>(getpid());
+#endif
+}
+std::string safeFilePart(std::string value) {
+    for (char& ch : value) {
+        const bool safe = (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
+                          (ch >= 'a' && ch <= 'z') || ch == '-' || ch == '_';
+        if (!safe) ch = '_';
+    }
+    return value.empty() ? "unknown" : value;
+}
+fs::path dailyOrderStatePath(const Config& c) {
+    return fs::path("state") /
+        ("daily_order_count_" + safeFilePart(c.broker) + "_" + safeFilePart(c.user) + ".ini");
+}
+
+class DailyOrderCounter {
+    struct StoredState { std::string tradingDay; int submittedCount = 0; };
+    fs::path path_;
+    int configuredLimit_;
+#ifdef _WIN32
+    HANDLE mutex_ = nullptr;
+#endif
+
+    StoredState readLocked() const {
+        if (!fs::exists(path_)) return {};
+        std::ifstream input(path_, std::ios::binary);
+        if (!input) throw std::runtime_error("Daily order count state cannot be opened; order blocked.");
+        StoredState state;
+        bool sawDay = false, sawCount = false;
+        std::string line;
+        while (std::getline(input, line)) {
+            line = trim(line);
+            if (line.empty()) continue;
+            const auto equal = line.find('=');
+            if (equal == std::string::npos)
+                throw std::runtime_error("Daily order count state is invalid; order blocked.");
+            const std::string key = trim(line.substr(0, equal));
+            const std::string value = trim(line.substr(equal + 1));
+            if (key == "trading_day" && !sawDay) {
+                if (!validTradingDay(value))
+                    throw std::runtime_error("Daily order count trading day is invalid; order blocked.");
+                state.tradingDay = value; sawDay = true;
+            } else if (key == "submitted_count" && !sawCount) {
+                if (value.empty() || value.size() > 9 || value.find_first_not_of("0123456789") != std::string::npos)
+                    throw std::runtime_error("Daily order count value is invalid; order blocked.");
+                const auto parsed = std::stoll(value);
+                if (parsed < 0 || parsed > 999999999)
+                    throw std::runtime_error("Daily order count value is invalid; order blocked.");
+                state.submittedCount = static_cast<int>(parsed); sawCount = true;
+            } else {
+                throw std::runtime_error("Daily order count state has duplicate or unknown fields; order blocked.");
+            }
+        }
+        if (input.bad() || !sawDay || !sawCount)
+            throw std::runtime_error("Daily order count state is incomplete; order blocked.");
+        return state;
+    }
+    void writeLocked(const StoredState& state) const {
+        fs::create_directories(path_.parent_path());
+        fs::path temporary = path_;
+        temporary += ".tmp." + std::to_string(processIdNumber());
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            if (!output) throw std::runtime_error("Daily order count state cannot be written; order blocked.");
+            output << "trading_day=" << state.tradingDay << '\n'
+                   << "submitted_count=" << state.submittedCount << '\n';
+            output.flush();
+            if (!output) {
+                std::error_code ignored; fs::remove(temporary, ignored);
+                throw std::runtime_error("Daily order count state write failed; order blocked.");
+            }
+        }
+#ifdef _WIN32
+        if (!MoveFileExW(temporary.c_str(), path_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            std::error_code ignored; fs::remove(temporary, ignored);
+            throw std::runtime_error("Daily order count state replacement failed; order blocked.");
+        }
+#else
+        std::error_code error;
+        fs::rename(temporary, path_, error);
+        if (error) {
+            std::error_code ignored; fs::remove(temporary, ignored);
+            throw std::runtime_error("Daily order count state replacement failed; order blocked.");
+        }
+#endif
+    }
+    DailyOrderRiskDecision reserveLocked(const std::string& tradingDay) {
+        StoredState state = readLocked();
+        if (state.tradingDay != tradingDay) {
+            state.tradingDay = tradingDay;
+            state.submittedCount = 0;
+        }
+        const auto decision = evaluateDailyOrderRisk(configuredLimit_, state.submittedCount, tradingDay);
+        if (decision.allowed) {
+            state.submittedCount = decision.submittedAfter;
+            writeLocked(state); // 先保守计数，再实际调用 ReqOrderInsert；失败或拒单也属于一次报单尝试。
+        }
+        return decision;
+    }
+public:
+    DailyOrderCounter(fs::path path, int configuredLimit, const Config& c)
+        : path_(std::move(path)), configuredLimit_(configuredLimit) {
+        if (configuredLimit_ < 1) throw std::runtime_error("daily_max_order_count is not configured; order blocked.");
+#ifdef _WIN32
+        const std::string suffix = safeFilePart(c.broker) + "_" + safeFilePart(c.user);
+        const std::wstring name = L"Local\\CTPStockConnectivity_DailyOrderCount_" +
+                                  std::wstring(suffix.begin(), suffix.end());
+        mutex_ = CreateMutexW(nullptr, FALSE, name.c_str());
+        if (!mutex_) throw std::runtime_error("Daily order count mutex creation failed; order blocked.");
+#else
+        (void)c;
+#endif
+    }
+    ~DailyOrderCounter() {
+#ifdef _WIN32
+        if (mutex_) CloseHandle(mutex_);
+#endif
+    }
+    DailyOrderCounter(const DailyOrderCounter&) = delete;
+    DailyOrderCounter& operator=(const DailyOrderCounter&) = delete;
+    DailyOrderRiskDecision reserve(const std::string& tradingDay) {
+        if (!validTradingDay(tradingDay))
+            throw std::runtime_error("Login did not return a valid trading day; order blocked by risk control.");
+#ifdef _WIN32
+        const DWORD wait = WaitForSingleObject(mutex_, 5000);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
+            throw std::runtime_error("Daily order count lock timeout; order blocked.");
+        struct Release { HANDLE handle; ~Release() { ReleaseMutex(handle); } } release{mutex_};
+        return reserveLocked(tradingDay);
+#else
+        static std::mutex fallbackMutex;
+        std::lock_guard<std::mutex> lock(fallbackMutex);
+        return reserveLocked(tradingDay);
+#endif
+    }
+};
+
+void showRiskSettingsDialog(int configuredLimit) {
+#ifdef _WIN32
+    const std::wstring text = L"风控设置（每日最大报单量）\n\n"
+        L"报备阈值／每日最大报单量：" + std::to_wstring(configuredLimit) + L" 笔\n"
+        L"配置项：daily_max_order_count\n"
+        L"统计口径：每次 ReqOrderInsert 调用计 1 笔\n"
+        L"统计周期：交易日\n"
+        L"计数范围：当前账号及本项目目录";
+    MessageBoxW(nullptr, text.c_str(), L"CTPStockConnectivity 风控设置",
+                MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+#else
+    (void)configuredLimit;
+#endif
+}
+void showRiskTriggerDialog(const DailyOrderRiskDecision& decision, bool selfTest);
+
+std::string localCalendarDay() {
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &now);
+#else
+    localtime_r(&now, &local);
+#endif
+    std::ostringstream out;
+    out << std::put_time(&local, "%Y%m%d");
+    return out.str();
+}
+fs::path createRunLogDirectory(std::string& runId) {
+    runId = timestamp(true) + "_pid" + std::to_string(processIdNumber());
+    fs::create_directories("logs");
+    fs::path logDir = fs::path("logs") / runId;
+    // 毫秒+PID 通常足够；仍检测碰撞，任何运行都不覆盖旧日志。
+    for (int n = 1; !fs::create_directory(logDir); ++n)
+        logDir = fs::path("logs") / (runId + "_" + std::to_string(n));
+    runId = logDir.filename().string();
+    return logDir;
+}
+bool runRiskEvidence(const Config& c, const Options& o, const Secrets& secret) {
+    if (c.dailyMaxOrderCount < 1)
+        throw std::runtime_error("Risk evidence requires daily_max_order_count in config/connection.local.ini.");
+    std::string runId;
+    const fs::path logDir = createRunLogDirectory(runId);
+    Logger log(logDir / "run.log", secret);
+    log.write(std::string("PROGRAM version=") + kVersion + " sdk_package=traderAPI_3.7.5_CP_20251125");
+    log.write("RUN id=" + runId + " test=risk risk_action=" + o.riskAction +
+              " user=" + c.user + " broker=" + c.broker);
+    log.write("RISK CONFIG rule=daily_max_order_count configured_limit=" +
+              std::to_string(c.dailyMaxOrderCount) +
+              " unit=orders counting_rule=ReqOrderInsert_attempts period=trading_day");
+    log.write("RISK NOTICE evidence_mode=LOCAL_SELF_TEST network=NOT_CONNECTED credentials=NOT_USED order_api=NOT_CALLED");
+    if (o.riskAction == "settings") {
+        showRiskSettingsDialog(c.dailyMaxOrderCount);
+        log.write("RISK RESULT status=PASS action=settings screenshot_dialog=REQUESTED");
+    } else {
+        const auto decision = evaluateDailyOrderRisk(c.dailyMaxOrderCount, c.dailyMaxOrderCount,
+                                                     localCalendarDay());
+        log.write("RISK SELF_TEST injected_submitted_count=" + std::to_string(decision.submittedBefore) +
+                  " configured_limit=" + std::to_string(decision.configuredLimit) +
+                  " production_state_file=NOT_READ_OR_WRITTEN");
+        showRiskTriggerDialog(decision, true);
+        log.write("RISK TRIGGER rule=daily_max_order_count decision=BLOCK api_call=NOT_SENT");
+        log.write("RISK RESULT status=PASS action=trigger control=BLOCKED_AS_EXPECTED");
+    }
+    log.write("EVIDENCE log=" + fs::absolute(logDir / "run.log").string());
+    return true;
+}
+void showRiskTriggerDialog(const DailyOrderRiskDecision& decision, bool selfTest) {
+#ifdef _WIN32
+    const std::wstring text = L"风控触发：已达到每日最大报单量\n\n"
+        L"报备阈值：" + std::to_wstring(decision.configuredLimit) + L" 笔\n"
+        L"当日已计数：" + std::to_wstring(decision.submittedBefore) + L" 笔\n"
+        L"本次报单：已在本地拦截，未发送至柜台\n"
+        L"测试触发：" + std::wstring(selfTest ? L"是（未发送真实报单）" : L"否");
+    MessageBoxW(nullptr, text.c_str(), L"CTPStockConnectivity 风控触发",
+                MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+#else
+    (void)decision; (void)selfTest;
+#endif
+}
 
 enum class Stage { Connect, Authenticate, Login, Account };
 enum class RequestIdPolicy { Strict, AllowZero };
@@ -806,6 +1077,25 @@ bool testBasicFunction(CThostFtdcTraderApi& api, const Config& c, const Options&
         return true;
     }
 
+    const std::string tradingDay = trim(textField(login.login.TradingDay));
+    DailyOrderCounter counter(dailyOrderStatePath(c), c.dailyMaxOrderCount, c);
+    const auto risk = counter.reserve(tradingDay);
+    log.write("RISK CHECK rule=daily_max_order_count configured_limit=" +
+              std::to_string(risk.configuredLimit) +
+              " submitted_before=" + std::to_string(risk.submittedBefore) +
+              " submitted_after=" + std::to_string(risk.submittedAfter) +
+              " trading_day=" + risk.tradingDay +
+              " decision=" + (risk.allowed ? "ALLOW" : "BLOCK") +
+              " counting_rule=ReqOrderInsert_attempts state_file=" +
+              fs::absolute(dailyOrderStatePath(c)).string());
+    if (!risk.allowed) {
+        log.write("RISK TRIGGER rule=daily_max_order_count decision=BLOCK api_call=NOT_SENT");
+        showRiskTriggerDialog(risk, false);
+        log.write("BASIC RESULT status=FAIL strategy=PASS order=BLOCKED_BY_RISK cancel=NOT_RUN "
+                  "traded_volume=0 reason=daily maximum order count reached");
+        return false;
+    }
+
     lifecycle.start(orderRef);
     log.write("BASIC LIVE_ORDER_START exactly_one_order=YES automatic_retry=NO automatic_reprice=NO");
     auto request = order; // SDK 接口不是 const；缓冲在整个等待阶段保持有效。
@@ -918,17 +1208,23 @@ int main(int argc, char** argv) {
                          "       --mode trader --test basic --instrument ID --exchange SSE|SZSE\n"
                          "       --direction buy|sell --offset open|close --price PRICE\n"
                          "       [--send-order --confirm SEND_ONE_ORDER]\n"
+                         "       --test risk --risk-action settings\n"
+                         "       --test risk --risk-action trigger --confirm TRIGGER_DAILY_ORDER_LIMIT\n"
                          "Default: all, config/connection.ini, 30 seconds PER STAGE, account query enabled.\n"
                          "Credentials: nonempty local INI > main INI > CTP_PASSWORD / CTP_AUTH_CODE > hidden prompts.\n"
                          "config/connection.local.ini is loaded automatically when using the default config.\n"
                          "Basic test defaults to dry-run. --send-order transmits one GFD limit order with volume=1\n"
                          "and attempts to cancel it; it may trade before cancellation. No automatic retry/reprice.\n"
+                         "Risk evidence mode displays screenshot dialogs without credentials, network, or order calls.\n"
                          "MD-only mode does not need CTP_AUTH_CODE. No password-update operation.\n";
             return 0;
         }
         printVersions();
         if (options.version) return 0; // help/version 不读配置、不索取密码、不连接网络。
         const Config config = readConfig(options.config, secret);
+        if (options.test == "risk") return runRiskEvidence(config, options, secret) ? 0 : 1;
+        if (options.test == "basic" && options.sendOrder && config.dailyMaxOrderCount < 1)
+            throw std::runtime_error("Live order transmission requires daily_max_order_count in config/connection.local.ini.");
         secret.password = getSecret(secret.password, "CTP_PASSWORD", "Trading password (hidden): ");
         if (options.mode != "md") secret.auth = getSecret(secret.auth, "CTP_AUTH_CODE", "Authentication code (hidden): ");
         // 先校验所有固定长度字段，避免连上前置后才发现输入被截断或无效。
@@ -939,17 +1235,9 @@ int main(int argc, char** argv) {
         CThostFtdcQryTradingAccountField qcheck{};
         field(qcheck.InvestorID, config.investor, "investor_id");
         if (options.test == "basic") (void)basicOrderRequest(config, options, "1");
-#ifdef _WIN32
-        const auto pid = GetCurrentProcessId();
-#else
-        const auto pid = getpid();
-#endif
-        std::string runId = timestamp(true) + "_pid" + std::to_string(pid);
-        fs::create_directories("logs"); fs::create_directories("flow");
-        fs::path logDir = fs::path("logs") / runId;
-        // 毫秒+PID 通常足够；仍检测碰撞，任何运行都不覆盖旧日志/流文件。
-        for (int n = 1; !fs::create_directory(logDir); ++n) logDir = fs::path("logs") / (runId + "_" + std::to_string(n));
-        runId = logDir.filename().string();
+        std::string runId;
+        const fs::path logDir = createRunLogDirectory(runId);
+        fs::create_directories("flow");
         const fs::path flowDir = fs::path("flow") / runId;
         if (fs::exists(flowDir)) throw std::runtime_error("Flow directory collision; rerun to obtain a new run ID.");
         fs::create_directories(flowDir / "trader"); fs::create_directories(flowDir / "md");
@@ -959,6 +1247,9 @@ int main(int argc, char** argv) {
         log.write("RUN id=" + runId + " mode=" + options.mode + " test=" + options.test +
                   " user=" + config.user + " broker=" + config.broker);
         log.write("CONFIG app_id=" + config.app + " investor_id=" + config.investor);
+        log.write("RISK CONFIG rule=daily_max_order_count configured_limit=" +
+                  (config.dailyMaxOrderCount > 0 ? std::to_string(config.dailyMaxOrderCount) : "NOT_CONFIGURED") +
+                  " unit=orders counting_rule=ReqOrderInsert_attempts period=trading_day");
         log.write("FRONTS trader=" + config.trader + " md=" + config.md);
         log.write("TIME timestamps=host_local_wall_clock; elapsed_timeouts=monotonic; check local clock before evidence capture");
         const std::string admin = administratorStatus();

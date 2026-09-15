@@ -103,6 +103,22 @@ int main(int argc, char** argv) {
             require(secret.password == "LocalDummy42" && secret.auth == "LocalDummyAuth", "Local override missing");
             require(c.user == "LOCAL_TEST_USER" && c.investor == c.user, "Connection override missing");
         });
+        test("daily maximum order count accepts local risk configuration", [] {
+            const auto path = configFile("risk-local", "[risk]\ndaily_max_order_count=12\n");
+            writeFile(path.parent_path() / "connection.local.ini",
+                      "[risk]\ndaily_max_order_count=34\n");
+            Secrets secret;
+            const auto c = readConfig(path.string(), secret);
+            require(c.dailyMaxOrderCount == 34, "Local daily order limit did not override main config");
+        });
+        test("daily maximum order count validates positive integer range", [] {
+            require(parseDailyMaxOrderCount("1") == 1 &&
+                    parseDailyMaxOrderCount("999999999") == 999999999,
+                    "Daily order count valid boundary changed");
+            rejects([] { (void)parseDailyMaxOrderCount("0"); }, "integer from 1");
+            rejects([] { (void)parseDailyMaxOrderCount("1.5"); }, "integer from 1");
+            rejects([] { (void)parseDailyMaxOrderCount("1000000000"); }, "integer from 1");
+        });
         test("blank local values retain each nonempty main credential", [] {
             const auto path = configFile("blank-local", "password=MainDummy42\nauth_code=MainDummyAuth\n");
             writeFile(path.parent_path() / "connection.local.ini", "password= \nauth_code=\n");
@@ -206,6 +222,54 @@ int main(int argc, char** argv) {
                     "Insert rejection name changed");
             require(std::string(orderStatusName(THOST_FTDC_OST_Canceled)) == "CANCELED",
                     "Canceled order name changed");
+        });
+        test("risk evidence actions require explicit safe confirmation", [] {
+            const auto settings = parse({"--test", "risk", "--risk-action", "settings"});
+            require(settings.test == "risk" && settings.riskAction == "settings",
+                    "Risk settings action did not parse");
+            const auto trigger = parse({"--test", "risk", "--risk-action", "trigger",
+                                        "--confirm", "TRIGGER_DAILY_ORDER_LIMIT"});
+            require(trigger.riskAction == "trigger", "Risk trigger action did not parse");
+            rejects([] { (void)parse({"--test", "risk", "--risk-action", "trigger"}); },
+                    "requires --confirm");
+            rejects([] { (void)parse({"--test", "risk", "--risk-action", "settings",
+                                      "--send-order"}); },
+                    "does not accept");
+        });
+        test("daily order risk allows through limit then blocks", [] {
+            const auto before = evaluateDailyOrderRisk(3, 2, "20260915");
+            require(before.allowed && before.submittedBefore == 2 && before.submittedAfter == 3,
+                    "Last allowed order was not counted");
+            const auto reached = evaluateDailyOrderRisk(3, 3, "20260915");
+            require(!reached.allowed && reached.submittedBefore == 3 && reached.submittedAfter == 3,
+                    "Order at reached limit was not blocked");
+        });
+        test("daily order counter persists and resets on trading day change", [] {
+            Config config;
+            const fs::path path = testRoot / "daily-counter" / "counter.ini";
+            {
+                DailyOrderCounter counter(path, 2, config);
+                const auto first = counter.reserve("20260915");
+                const auto second = counter.reserve("20260915");
+                const auto blocked = counter.reserve("20260915");
+                require(first.allowed && first.submittedAfter == 1, "First attempt not reserved");
+                require(second.allowed && second.submittedAfter == 2, "Second attempt not reserved");
+                require(!blocked.allowed && blocked.submittedAfter == 2, "Third attempt not blocked");
+            }
+            {
+                DailyOrderCounter counter(path, 2, config);
+                require(!counter.reserve("20260915").allowed, "Counter did not persist across instances");
+                const auto nextDay = counter.reserve("20260916");
+                require(nextDay.allowed && nextDay.submittedBefore == 0 && nextDay.submittedAfter == 1,
+                        "Counter did not reset on trading day change");
+            }
+        });
+        test("invalid daily order state fails closed", [] {
+            Config config;
+            const fs::path path = testRoot / "invalid-daily-counter" / "counter.ini";
+            writeFile(path, "trading_day=20260915\nsubmitted_count=bad\n");
+            DailyOrderCounter counter(path, 10, config);
+            rejects([&] { (void)counter.reserve("20260915"); }, "value");
         });
         test("SDK credential field lengths fail without values", [] {
             CThostFtdcReqUserLoginField login{};
