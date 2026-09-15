@@ -41,7 +41,7 @@ void checkCommonTrigger(bool selfTest) {
     contains(L"每日报备阈值：123 笔");
     contains(L"每秒报备阈值：7 笔／秒");
     contains(L"本次报单：已在本地拦截，未发送至柜台");
-    contains(selfTest ? L"测试触发：是（未发送真实报单）" : L"测试触发：否");
+    contains(selfTest ? L"离线注入自测：是（未发送真实报单）" : L"离线注入自测：否（使用真实报单计数）");
     require(shownTitle.find(L"风控触发") != std::wstring::npos, "Wrong trigger popup title");
     require(shownFlags == (MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND),
             "Trigger popup lost warning or foreground flags");

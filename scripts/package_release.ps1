@@ -30,11 +30,13 @@ Copy-Item -LiteralPath (Join-Path $ctpRoot 'docs') -Destination $ctpStage -Recur
 Copy-Item -LiteralPath (Join-Path $ctpRoot 'run_windows.bat') -Destination $ctpStage
 Copy-Item -LiteralPath (Join-Path $ctpRoot 'run_basic_windows.bat') -Destination $ctpStage
 Copy-Item -LiteralPath (Join-Path $ctpRoot 'run_risk_windows.bat') -Destination $ctpStage
+Copy-Item -LiteralPath (Join-Path $ctpRoot 'run_rate_windows.bat') -Destination $ctpStage
 $ctpRuntimeReadme = @'
 # CTPStockConnectivity runtime snapshot
 
 This package contains the executable already built on the packaging machine.
-It is a connectivity and guarded basic-function test tool, not a completed evaluation submission.
+It provides connectivity, guarded basic-function tests, and a bounded live
+per-second order-limit test. It is not a completed evaluation submission.
 
 On the evaluation physical Windows PC, open an elevated PowerShell terminal,
 change to this package directory, then run:
@@ -54,13 +56,38 @@ thresholds, then use run_risk_windows.bat settings to display both values.
 Use run_risk_windows.bat trigger for daily evidence and trigger-second for
 per-second evidence. Both are labeled offline threshold-injection tests;
 neither connects, sends an order, nor changes real counters. They do not
-demonstrate actual order throughput. Do not mass-submit orders for screenshots.
+demonstrate actual order throughput.
+
+For a real per-second test, use run_rate_windows.bat with the current instrument,
+exchange, direction, offset, price and explicit --max-orders N. N must equal the
+filed per_second_max_order_count and be 1..10. Larger filed limits remain valid
+for the risk guard but are not supported by this bounded live test; do not lower
+a filed limit for screenshots. Both limits must be configured. The daily
+remaining allowance must be at least N+1 and the recent 1000ms window must be
+empty before the first order. Insufficient allowance stops without sending;
+the test never resets counters, increases limits, or automatically retries.
+
+Without --send-order, rate-live displays an offline plan before credentials,
+API creation or network access. Actual submission requires both --send-order
+and --confirm SEND_RATE_TEST_ORDERS. It uses one login and sends at most N
+individual one-lot limit orders with identical parameters. Up to N lots can
+fill. The next eligibility check must be blocked by the per-second rule; that
+N+1 check never sends an order, even if the rolling window has expired. SDK
+submission errors, counter rejection, timing failure or unknown outcomes fail
+the test. It records actual API calls, observed peak, each order result and the
+extra check as api_call=NOT_SENT. It never retries or reprices automatically.
+
+The program requests at most one cancellation per outstanding order, then
+waits against a shared cleanup deadline. The risk popup appears after cleanup.
+Check the trading terminal for unknown residual orders and any fills; there
+is no automatic offsetting trade. See docs/CODE_GUIDE.md for the flow. Do not
+replace this bounded test with concurrent PowerShell order-submission loops.
 
 For one-time setup, copy config/connection.local.ini.example to
 config/connection.local.ini and fill password=, auth_code=, and the exact filed
 daily_max_order_count= and per_second_max_order_count= there (1..999999999).
-Live basic orders and risk evidence require both thresholds. Ordinary
-connectivity and basic dry-run tests can run without configured thresholds.
+Live basic orders, rate-live plans/submissions, and risk evidence require both
+thresholds. Ordinary connectivity and basic dry-run tests can run without them.
 Future runs load those values automatically without prompting.
 The runtime package never includes credentials from the packaging machine.
 Without configured values, CTP_PASSWORD / CTP_AUTH_CODE and hidden prompts
@@ -69,7 +96,8 @@ The config/connection.ini contains account identifiers and evaluation fronts.
 Read docs/CODE_GUIDE.md and docs/REPORT_ROADMAP.md for scope and next steps.
 The default connectivity test sends no orders. The basic test is dry-run unless
 --send-order and --confirm SEND_ONE_ORDER are both present; that mode can trade.
-Each run sends at most one order of one lot and attempts at most one cancel.
+Each basic run sends at most one order of one lot and attempts at most one
+cancel. The separate rate-live mode has the explicit N-order budget above.
 Daily and rolling-1000ms limits jointly guard each ReqOrderInsert attempt,
 including immediate API errors and later counter rejections. Cancellations
 are not counted or rate-limited. A blocked attempt consumes neither limit.

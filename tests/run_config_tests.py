@@ -123,7 +123,7 @@ def main():
         prompt_test(binary)
         windows_credential_branch_test(root, build, compiler)
         windows_risk_dialog_test(root, build, compiler)
-        for name in ("order_rate_test", "order_fill_test"):
+        for name in ("order_rate_test", "order_fill_test", "live_rate_test"):
             binary = compile_offline_test(root, build, compiler, name)
             subprocess.run([str(binary), str(build / (name + "_fixtures"))],
                            stdin=subprocess.DEVNULL, check=True)

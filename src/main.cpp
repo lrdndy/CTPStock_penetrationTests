@@ -41,7 +41,7 @@
 using namespace ctp_sopt;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock; // 超时用单调时钟，避免系统校时影响等待时间。
-constexpr const char* kVersion = "v0.4.0";
+constexpr const char* kVersion = "v0.5.0";
 constexpr const char* kTraderFront = "tcp://101.226.254.157:32205";
 constexpr const char* kMdFront = "tcp://101.226.254.157:32213";
 
@@ -57,7 +57,7 @@ struct Options {
     std::string test = "connectivity", instrument, exchange, direction, offset, confirmation, riskAction;
     std::string orderGoal = "cancel";
     double price = 0.0;
-    int timeout = 30, fillWait = 10;
+    int timeout = 30, fillWait = 10, maxOrders = 0;
     bool skipQuery = false, sendOrder = false, help = false, version = false;
 };
 
@@ -92,7 +92,7 @@ int parsePerSecondMaxOrderCount(const std::string& value) {
 }
 Options parseOptions(int argc, char** argv) {
     Options o;
-    bool orderGoalProvided = false, fillWaitProvided = false;
+    bool orderGoalProvided = false, fillWaitProvided = false, maxOrdersProvided = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") { o.help = true; continue; }
@@ -102,7 +102,7 @@ Options parseOptions(int argc, char** argv) {
         if (arg != "--mode" && arg != "--config" && arg != "--timeout" && arg != "--test" &&
             arg != "--instrument" && arg != "--exchange" && arg != "--direction" &&
             arg != "--offset" && arg != "--price" && arg != "--confirm" && arg != "--risk-action" &&
-            arg != "--order-goal" && arg != "--fill-wait")
+            arg != "--order-goal" && arg != "--fill-wait" && arg != "--max-orders")
             throw std::runtime_error("Unknown option; use --help.");
         if (++i == argc) throw std::runtime_error("Missing option value; use --help.");
         std::string value = argv[i];
@@ -120,6 +120,14 @@ Options parseOptions(int argc, char** argv) {
         else if (arg == "--offset") o.offset = value;
         else if (arg == "--confirm") o.confirmation = value;
         else if (arg == "--risk-action") o.riskAction = value;
+        else if (arg == "--max-orders") {
+            maxOrdersProvided = true;
+            if (value.empty() || value.size() > 2 || value.find_first_not_of("0123456789") != std::string::npos)
+                throw std::runtime_error("--max-orders must be an explicit integer from 1 to 10.");
+            o.maxOrders = std::stoi(value);
+            if (o.maxOrders < 1 || o.maxOrders > 10)
+                throw std::runtime_error("--max-orders must be an explicit integer from 1 to 10.");
+        }
         else if (arg == "--order-goal") { o.orderGoal = value; orderGoalProvided = true; }
         else if (arg == "--fill-wait") {
             fillWaitProvided = true;
@@ -138,8 +146,12 @@ Options parseOptions(int argc, char** argv) {
     }
     if (o.mode != "all" && o.mode != "trader" && o.mode != "md")
         throw std::runtime_error("--mode must be trader, md, or all.");
-    if (o.test != "connectivity" && o.test != "basic" && o.test != "risk")
-        throw std::runtime_error("--test must be connectivity, basic, or risk.");
+    if (o.test != "connectivity" && o.test != "basic" && o.test != "risk" && o.test != "rate-live")
+        throw std::runtime_error("--test must be connectivity, basic, risk, or rate-live.");
+    if (maxOrdersProvided && o.test != "rate-live")
+        throw std::runtime_error("--max-orders requires --test rate-live.");
+    if (o.test == "rate-live" && !maxOrdersProvided)
+        throw std::runtime_error("--test rate-live requires an explicit --max-orders budget from 1 to 10.");
     if (o.orderGoal != "cancel" && o.orderGoal != "fill")
         throw std::runtime_error("--order-goal must be cancel or fill.");
     if ((orderGoalProvided || fillWaitProvided) && o.test != "basic")
@@ -149,23 +161,24 @@ Options parseOptions(int argc, char** argv) {
     if (o.test == "connectivity") {
         if (o.sendOrder || !o.instrument.empty() || !o.exchange.empty() || !o.direction.empty() ||
             !o.offset.empty() || o.price != 0.0 || !o.confirmation.empty() || !o.riskAction.empty())
-            throw std::runtime_error("Order options require --test basic.");
-    } else if (o.test == "basic") {
-        if (o.mode != "trader") throw std::runtime_error("--test basic requires --mode trader.");
+            throw std::runtime_error("Order options require --test basic or rate-live.");
+    } else if (o.test == "basic" || o.test == "rate-live") {
+        if (o.mode != "trader") throw std::runtime_error("Order tests require --mode trader.");
         if (o.instrument.empty() || o.exchange.empty() || o.direction.empty() || o.offset.empty() || o.price <= 0.0)
-            throw std::runtime_error("--test basic requires --instrument, --exchange, --direction, --offset, and --price.");
+            throw std::runtime_error("Order tests require --instrument, --exchange, --direction, --offset, and --price.");
         if (o.exchange != "SSE" && o.exchange != "SZSE")
             throw std::runtime_error("--exchange must be SSE or SZSE.");
         if (o.direction != "buy" && o.direction != "sell")
             throw std::runtime_error("--direction must be buy or sell.");
         if (o.offset != "open" && o.offset != "close")
             throw std::runtime_error("--offset must be open or close.");
-        if (o.sendOrder && o.confirmation != "SEND_ONE_ORDER")
-            throw std::runtime_error("Live transmission requires --confirm SEND_ONE_ORDER.");
+        const std::string requiredConfirmation = o.test == "rate-live" ? "SEND_RATE_TEST_ORDERS" : "SEND_ONE_ORDER";
+        if (o.sendOrder && o.confirmation != requiredConfirmation)
+            throw std::runtime_error("Live transmission requires --confirm " + requiredConfirmation + ".");
         if (!o.sendOrder && !o.confirmation.empty())
             throw std::runtime_error("--confirm is valid only with --send-order.");
         if (o.sendOrder && o.skipQuery)
-            throw std::runtime_error("Live basic test does not allow --skip-query.");
+            throw std::runtime_error("Live order tests do not allow --skip-query.");
         if (!o.riskAction.empty()) throw std::runtime_error("--risk-action requires --test risk.");
     } else {
         if (o.riskAction != "settings" && o.riskAction != "trigger" && o.riskAction != "trigger-second")
@@ -181,6 +194,14 @@ Options parseOptions(int argc, char** argv) {
             throw std::runtime_error("Risk settings display does not accept --confirm.");
     }
     return o;
+}
+void validateLiveRateConfig(const Config& c, const Options& o) {
+    if (c.perSecondMaxOrderCount < 1 || c.perSecondMaxOrderCount > 10)
+        throw std::runtime_error("Live rate test supports filed per_second_max_order_count from 1 to 10 only; keep the filed threshold unchanged.");
+    if (o.maxOrders != c.perSecondMaxOrderCount)
+        throw std::runtime_error("--max-orders must equal the configured per_second_max_order_count; no automatic budget increase.");
+    if (c.dailyMaxOrderCount <= c.perSecondMaxOrderCount)
+        throw std::runtime_error("Daily limit must leave at least N+1 attempts for this test so daily risk does not mask per-second risk; do not change filed limits for a test.");
 }
 void readConfigFile(const fs::path& path, Config& c, Secrets& secret) {
     std::ifstream in(path);
@@ -612,7 +633,8 @@ class DailyOrderCounter {
         }
 #endif
     }
-    DailyOrderRiskDecision reserveLocked(const std::string& tradingDay, std::uint64_t now, bool pending = false) {
+    DailyOrderRiskDecision reserveLocked(const std::string& tradingDay, std::uint64_t now,
+                                         bool pending = false, bool preview = false) {
         StoredState state = readLocked();
         if (state.pending)
             throw std::runtime_error("Previous submission was interrupted; reconcile the order and risk state before sending again.");
@@ -638,7 +660,7 @@ class DailyOrderCounter {
             ? evaluateOrderRisk(configuredLimit_, state.submittedCount, secondLimit_,
                                 static_cast<int>(state.recent.size()), tradingDay)
             : evaluateDailyOrderRisk(configuredLimit_, state.submittedCount, tradingDay);
-        if (decision.allowed) {
+        if (decision.allowed && !preview) {
             state.submittedCount = decision.submittedAfter;
             if (secondLimit_ > 0) state.recent.push_back(now);
             state.pending = pending;
@@ -647,6 +669,10 @@ class DailyOrderCounter {
         state.peakPerSecond = std::max(state.peakPerSecond, static_cast<int>(state.recent.size()));
         decision.peakPerSecond = state.peakPerSecond;
         if (stateChanged) writeLocked(state);
+        if (preview) {
+            decision.submittedAfter = decision.submittedBefore;
+            decision.secondAfter = decision.secondBefore;
+        }
         return decision;
     }
     template<class Operation> auto locked(Operation operation) -> decltype(operation()) {
@@ -694,19 +720,41 @@ public:
     DailyOrderRiskDecision reserve(const std::string& tradingDay) {
         return reserveAt(tradingDay, orderUptimeMs());
     }
+    DailyOrderRiskDecision check(const std::string& tradingDay) {
+        if (!validTradingDay(tradingDay) || secondLimit_ < 1)
+            throw std::runtime_error("Risk check requires a valid trading day and both configured limits.");
+        return locked([&] { return reserveLocked(tradingDay, orderUptimeMs(), false, true); });
+    }
     // 确定性离线边界测试入口；实发只能使用 submit，时钟由程序获取。
     DailyOrderRiskDecision reserveAt(const std::string& tradingDay, std::uint64_t now) {
         if (!validTradingDay(tradingDay))
             throw std::runtime_error("Login did not return a valid trading day; order blocked by risk control.");
         return locked([&] { return reserveLocked(tradingDay, now); });
     }
-    OrderSubmission submit(const std::string& tradingDay, const std::function<int()>& send) {
+    OrderSubmission submit(const std::string& tradingDay, const std::function<int()>& send,
+                           Clock::time_point deadline = Clock::time_point::max()) {
         if (!validTradingDay(tradingDay) || secondLimit_ < 1)
             throw std::runtime_error("Live order requires a valid trading day and both configured risk limits.");
         return locked([&] {
+            if (Clock::now() >= deadline)
+                throw std::runtime_error("Order send deadline expired while acquiring risk lock; no order sent.");
+            const bool bounded = deadline != Clock::time_point::max();
+            StoredState beforeReservation;
+            if (bounded) {
+                // Normalize date/expiry before saving a rollback point. A deadline
+                // expiring during disk I/O must neither send nor consume quota.
+                reserveLocked(tradingDay, orderUptimeMs(), false, true);
+                beforeReservation = readLocked();
+            }
             OrderSubmission result;
             result.risk = reserveLocked(tradingDay, orderUptimeMs(), true);
             if (!result.risk.allowed) return result;
+            if (Clock::now() >= deadline) {
+                // Still hold the same lock; no SDK call has happened. A failed
+                // restore leaves the pending reservation to block later sends.
+                writeLocked(beforeReservation);
+                throw std::runtime_error("Order send deadline expired before SDK call; reservation rolled back; no order sent.");
+            }
             // 持锁直到 SDK 调用返回，防止多进程通过检查后延迟集中发送。
             result.immediateRc = send();
             try {
@@ -811,7 +859,7 @@ void showRiskTriggerDialog(const DailyOrderRiskDecision& decision, bool selfTest
         L"最近连续 1000 毫秒已计数：" + std::to_wstring(decision.secondBefore) + L" 笔\n"
         + (selfTest ? L"自测窗口峰值：" : L"当日观察到的每秒峰值：") + std::to_wstring(decision.peakPerSecond) + L" 笔／秒\n"
         L"本次报单：已在本地拦截，未发送至柜台\n"
-        L"测试触发：" + std::wstring(selfTest ? L"是（未发送真实报单）" : L"否");
+        L"离线注入自测：" + std::wstring(selfTest ? L"是（未发送真实报单）" : L"否（使用真实报单计数）");
     MessageBoxW(nullptr, text.c_str(), L"CTPStockConnectivity 风控触发",
                 MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
 #else
@@ -1137,7 +1185,10 @@ public:
     }
     bool beginCancellation(bool allowWithoutQueueing = false) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (done_ || cancelAttempted_ || (!readyToCancel_ && !allowWithoutQueueing)) return false;
+        if (cancelAttempted_ || (!readyToCancel_ && !allowWithoutQueueing)) return false;
+        if (done_ && !(allowWithoutQueueing && residualUnknown_)) return false;
+        // An ambiguous error must not prevent one bounded cleanup attempt.
+        done_ = false;
         cancelAttempted_ = true;
         return true;
     }
@@ -1162,6 +1213,112 @@ public:
             fail("cancellation result timeout; residual order state UNKNOWN; check the counter immediately");
         return snapshot();
     }
+    OrderResult waitUntilDoneAt(Clock::time_point deadline) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!cv_.wait_until(lock, deadline, [this] { return done_; }))
+            fail("cancellation result timeout; residual order state UNKNOWN; check the counter immediately");
+        return snapshot();
+    }
+};
+
+// Own every burst request/lifecycle until API Release; callbacks never send orders.
+// The registry is prepared once, before sending, and its objects are never moved.
+class BatchOrders {
+public:
+    struct Entry {
+        std::string reference;
+        int insertId = 0, cancelId = 0;
+        bool submitted = false;
+        CThostFtdcInputOrderField request{};
+        CThostFtdcInputOrderActionField action{};
+        OrderLifecycle lifecycle;
+    };
+private:
+    std::mutex mutex_;
+    std::vector<std::unique_ptr<Entry>> orders_;
+    bool interrupted_ = false;
+    Entry* route(const std::string& reference, int request = 0, bool action = false) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& entry : orders_) {
+            if (request && request == (action ? entry->cancelId : entry->insertId))
+                return reference.empty() || reference == entry->reference ? entry.get() : nullptr;
+        }
+        if (!reference.empty()) for (auto& entry : orders_)
+            if (reference == entry->reference) return entry.get();
+        return nullptr;
+    }
+public:
+    void prepare(const Config& config, const Options& options,
+                 const CThostFtdcRspUserLoginField& login, int count) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!orders_.empty()) throw std::runtime_error("Live rate batch may only be prepared once.");
+        const auto first = std::stoull(nextOrderRef(login));
+        if (count < 1 || count > 10 || first + static_cast<unsigned>(count - 1) > 999999999999ULL)
+            throw std::runtime_error("Live rate batch exceeds safe order count/reference limits.");
+        for (int i = 0; i < count; ++i) {
+            auto entry = std::make_unique<Entry>();
+            entry->reference = std::to_string(first + static_cast<unsigned>(i));
+            entry->insertId = 100 + 2 * i; entry->cancelId = entry->insertId + 1;
+            entry->request = basicOrderRequest(config, options, entry->reference);
+            entry->request.RequestID = entry->insertId;
+            CThostFtdcOrderField identifiers{};
+            field(identifiers.OrderRef, entry->reference, "order_ref");
+            field(identifiers.InstrumentID, options.instrument, "instrument");
+            field(identifiers.ExchangeID, options.exchange, "exchange");
+            identifiers.FrontID = login.FrontID; identifiers.SessionID = login.SessionID;
+            entry->lifecycle.start(entry->reference, false, identifiers);
+            orders_.push_back(std::move(entry));
+        }
+    }
+    std::vector<Entry*> entries() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<Entry*> result;
+        for (auto& entry : orders_) result.push_back(entry.get());
+        return result;
+    }
+    void interrupted() { std::lock_guard<std::mutex> lock(mutex_); interrupted_ = true; }
+    bool hasFailure() {
+        { std::lock_guard<std::mutex> lock(mutex_); if (interrupted_) return true; }
+        for (auto* entry : entries()) {
+            const auto result = entry->lifecycle.current();
+            if (result.done && !result.filled && !result.canceled) return true;
+        }
+        return false;
+    }
+    void insertResponse(CThostFtdcInputOrderField* input, CThostFtdcRspInfoField* info, int id) {
+        if (auto* entry = route(input ? trim(textField(input->OrderRef)) : "", id))
+            entry->lifecycle.insertResponse(input, info);
+        else if (info && info->ErrorID) interrupted();
+    }
+    void actionResponse(CThostFtdcInputOrderActionField* input, CThostFtdcRspInfoField* info, int id) {
+        if (auto* entry = route(input ? trim(textField(input->OrderRef)) : "", id, true))
+            entry->lifecycle.actionResponse(input, info);
+        else if (info && info->ErrorID) interrupted();
+    }
+    void insertError(CThostFtdcInputOrderField* input, CThostFtdcRspInfoField* info) {
+        if (auto* entry = route(input ? trim(textField(input->OrderRef)) : ""))
+            entry->lifecycle.insertError(input, info);
+        else interrupted();
+    }
+    void actionError(CThostFtdcOrderActionField* input, CThostFtdcRspInfoField* info) {
+        if (auto* entry = route(input ? trim(textField(input->OrderRef)) : "", 0, true))
+            entry->lifecycle.actionError(input, info);
+        else interrupted();
+    }
+    void responseError(CThostFtdcRspInfoField* info, int id) {
+        // OnRspError itself is unexpected, even with missing/zero error data.
+        // Stop the burst without treating an ambiguous callback as a rejection;
+        // each sent lifecycle remains eligible for its single cleanup attempt.
+        interrupted();
+        if (auto* entry = route("", id)) entry->lifecycle.responseError(4, info);
+        else if (auto* entry = route("", id, true)) entry->lifecycle.responseError(5, info);
+    }
+    void returnedOrder(CThostFtdcOrderField* order) {
+        if (order) if (auto* entry = route(trim(textField(order->OrderRef)))) entry->lifecycle.returnedOrder(order);
+    }
+    void returnedTrade(CThostFtdcTradeField* trade) {
+        if (trade) if (auto* entry = route(trim(textField(trade->OrderRef)))) entry->lifecycle.returnedTrade(trade);
+    }
 };
 
 void logCallback(Logger& log, const char* channel, const char* name,
@@ -1182,13 +1339,15 @@ class TraderSpi final : public CThostFtdcTraderSpi {
     State& state_;
     Logger& log_;
     OrderLifecycle* order_;
+    BatchOrders* batch_;
 public:
-    TraderSpi(State& state, Logger& log, OrderLifecycle* order = nullptr)
-        : state_(state), log_(log), order_(order) {}
+    TraderSpi(State& state, Logger& log, OrderLifecycle* order = nullptr, BatchOrders* batch = nullptr)
+        : state_(state), log_(log), order_(order), batch_(batch) {}
     void OnFrontConnected() override { log_.write("TRADER CALLBACK OnFrontConnected"); state_.connected(); }
     void OnFrontDisconnected(int reason) override {
         log_.write("TRADER CALLBACK OnFrontDisconnected reason=" + std::to_string(reason));
         state_.disconnected(reason);
+        if (batch_) batch_->interrupted();
     }
     void OnHeartBeatWarning(int lapse) override {
         log_.write("TRADER CALLBACK OnHeartBeatWarning time_lapse=" + std::to_string(lapse));
@@ -1208,10 +1367,12 @@ public:
     void OnRspOrderInsert(CThostFtdcInputOrderField* p, CThostFtdcRspInfoField* e, int id, bool last) override {
         logCallback(log_, "TRADER", "OnRspOrderInsert", id, last, e);
         if (order_) order_->insertResponse(p, e);
+        if (batch_) batch_->insertResponse(p, e, id);
     }
     void OnRspOrderAction(CThostFtdcInputOrderActionField* p, CThostFtdcRspInfoField* e, int id, bool last) override {
         logCallback(log_, "TRADER", "OnRspOrderAction", id, last, e);
         if (order_) order_->actionResponse(p, e);
+        if (batch_) batch_->actionResponse(p, e, id);
     }
     void OnRtnOrder(CThostFtdcOrderField* p) override {
         if (!p) { log_.write("TRADER CALLBACK OnRtnOrder payload=NULL"); return; }
@@ -1228,6 +1389,7 @@ public:
              << " status_msg=" << sdkText(textField(p->StatusMsg));
         log_.write(line.str());
         if (order_) order_->returnedOrder(p);
+        if (batch_) batch_->returnedOrder(p);
     }
     void OnRtnTrade(CThostFtdcTradeField* p) override {
         if (!p) { log_.write("TRADER CALLBACK OnRtnTrade payload=NULL"); return; }
@@ -1238,6 +1400,7 @@ public:
              << " price=" << std::fixed << std::setprecision(6) << p->Price << " volume=" << p->Volume;
         log_.write(line.str());
         if (order_) order_->returnedTrade(p);
+        if (batch_) batch_->returnedTrade(p);
     }
     void OnErrRtnOrderInsert(CThostFtdcInputOrderField* p, CThostFtdcRspInfoField* e) override {
         std::string line = "TRADER CALLBACK OnErrRtnOrderInsert order_ref=" +
@@ -1246,6 +1409,7 @@ public:
         else line += " RspInfo=NULL";
         log_.write(line);
         if (order_) order_->insertError(p, e);
+        if (batch_) batch_->insertError(p, e);
     }
     void OnErrRtnOrderAction(CThostFtdcOrderActionField* p, CThostFtdcRspInfoField* e) override {
         std::string line = "TRADER CALLBACK OnErrRtnOrderAction order_ref=" +
@@ -1254,11 +1418,13 @@ public:
         else line += " RspInfo=NULL";
         log_.write(line);
         if (order_) order_->actionError(p, e);
+        if (batch_) batch_->actionError(p, e);
     }
     void OnRspError(CThostFtdcRspInfoField* e, int id, bool last) override {
         logCallback(log_, "TRADER", "OnRspError", id, last, e);
         state_.error(e, id, last);
         if (order_) order_->responseError(id, e);
+        if (batch_) batch_->responseError(e, id);
     }
 };
 class MdSpi final : public CThostFtdcMdSpi {
@@ -1454,10 +1620,170 @@ bool testBasicFunction(CThostFtdcTraderApi& api, const Config& c, const Options&
     lifecycle.cancellationSubmitted(cancelRc);
     return finish(lifecycle.waitUntilDone(o.timeout));
 }
+// A single authorized burst exercises the real guard. Its (N+1)th candidate is
+// checked without reserving quota or calling the SDK, even if the window expires.
+template<class Api> bool testLiveRateFunction(Api& api, const Config& c, const Options& o,
+                       const Result& login, BatchOrders& batch, Logger& log, bool showDialog = true) {
+    bool operationalOk = true;
+    auto write = [&](const std::string& message) {
+        try { log.write(message); }
+        catch (...) { operationalOk = false; }
+    };
+    std::vector<BatchOrders::Entry*> entries;
+    std::unique_ptr<DailyOrderCounter> counter;
+    DailyOrderRiskDecision before, probe;
+    std::string tradingDay;
+    const int target = c.perSecondMaxOrderCount;
+    try {
+        validateLiveRateConfig(c, o);
+        if (o.test != "rate-live" || target < 1 || target > 10 || o.maxOrders != target)
+            throw std::runtime_error("Live rate test requires the complete configured threshold and a matching 1..10 order budget.");
+        batch.prepare(c, o, login.login, target);
+        entries = batch.entries();
+        if (!o.sendOrder) {
+            write("RATE_LIVE RESULT status=PASS mode=DRY_RUN api_calls=0 rate_limit_trigger=NOT_TESTED");
+            return operationalOk;
+        }
+        if (o.confirmation != "SEND_RATE_TEST_ORDERS")
+            throw std::runtime_error("Live rate test requires explicit SEND_RATE_TEST_ORDERS confirmation.");
+        tradingDay = trim(textField(login.login.TradingDay));
+        counter = std::make_unique<DailyOrderCounter>(dailyOrderStatePath(c), c.dailyMaxOrderCount, c);
+        before = counter->check(tradingDay);
+        write("RATE_LIVE PREFLIGHT configured_per_second_limit=" + std::to_string(target) +
+              " max_orders=" + std::to_string(o.maxOrders) +
+              " daily_count=" + std::to_string(before.submittedBefore) +
+              " recent_count=" + std::to_string(before.secondBefore) + " window_ms=1000");
+        if (!before.allowed || before.secondBefore != 0 || c.dailyMaxOrderCount - before.submittedBefore <= target)
+            throw std::runtime_error("Live rate test requires an empty rolling window and daily quota for N+1 candidates; no orders sent.");
+        if (batch.hasFailure() || !operationalOk)
+            throw std::runtime_error("Live rate test interrupted before sending.");
+    } catch (const std::exception& error) {
+        write(std::string("RATE_LIVE RESULT status=FAIL api_calls=0 reason=") + error.what());
+        return false;
+    }
+
+    int sent = 0;
+    bool triggerProven = false;
+    const auto started = Clock::now();
+    try {
+        for (auto* entry : entries) {
+            if (batch.hasFailure() || !operationalOk)
+                throw std::runtime_error("Observed an order error or disconnect; remaining burst stopped.");
+            if (Clock::now() - started >= std::chrono::milliseconds(1000))
+                throw std::runtime_error("One-second burst window expired; no additional orders sent.");
+            const auto submitted = counter->submit(tradingDay, [&] {
+                // Mark before calling: if an SDK call throws, reconcile this order too.
+                entry->submitted = true; ++sent;
+                return api.ReqOrderInsert(&entry->request, entry->insertId);
+            }, started + std::chrono::milliseconds(1000));
+            const auto& risk = submitted.risk;
+            write("RATE_LIVE RISK CHECK order_ref=" + entry->reference +
+                  " configured_limit=" + std::to_string(target) +
+                  " daily_before=" + std::to_string(risk.submittedBefore) +
+                  " daily_after=" + std::to_string(risk.submittedAfter) +
+                  " second_before=" + std::to_string(risk.secondBefore) +
+                  " second_after=" + std::to_string(risk.secondAfter) +
+                  " peak_per_second=" + std::to_string(risk.peakPerSecond) +
+                  " decision=" + (risk.allowed ? "ALLOW" : "BLOCK") +
+                  " blocked_rule=" + (risk.blockedRule.empty() ? "NONE" : risk.blockedRule));
+            if (!risk.allowed)
+                throw std::runtime_error("Risk control blocked a burst order; full rate threshold not demonstrated.");
+            entry->lifecycle.insertSubmitted(submitted.immediateRc);
+            write("RATE_LIVE CALL ReqOrderInsert request_id=" + std::to_string(entry->insertId) +
+                  " order_ref=" + entry->reference + " immediate_rc=" + std::to_string(submitted.immediateRc) +
+                  " volume=1 (submission only)");
+            if (!submitted.stateFinalized)
+                throw std::runtime_error("Order was sent but risk state finalization failed; cleanup required.");
+            if (submitted.immediateRc != 0 || batch.hasFailure())
+                throw std::runtime_error("An order submission was rejected or connection interrupted; burst stopped.");
+        }
+        probe = counter->check(tradingDay);
+        triggerProven = sent == target && !probe.allowed &&
+            probe.blockedRule == "per_second_max_order_count" && probe.secondBefore >= target &&
+            probe.submittedBefore == before.submittedBefore + sent &&
+            Clock::now() - started < std::chrono::milliseconds(1000);
+        write("RATE_LIVE NEXT_ORDER_CHECK candidate_number=" + std::to_string(target + 1) +
+              " configured_limit=" + std::to_string(target) +
+              " second_before=" + std::to_string(probe.secondBefore) +
+              " second_after=" + std::to_string(probe.secondAfter) +
+              " peak_per_second=" + std::to_string(probe.peakPerSecond) +
+              " decision=" + (probe.allowed ? "ALLOW" : "BLOCK") +
+              " blocked_rule=" + (probe.blockedRule.empty() ? "NONE" : probe.blockedRule) +
+              " check_only=YES quota_reserved=NO api_call=NOT_SENT");
+        if (triggerProven)
+            write("RISK TRIGGER rule=per_second_max_order_count decision=BLOCK api_call=NOT_SENT evidence=LIVE_PRECEDING_ORDERS next_candidate=CHECK_ONLY");
+        else write("RATE_LIVE RATE_EVIDENCE status=NOT_PROVEN no_extra_order_sent=YES no_retry=YES");
+    } catch (const std::exception& error) {
+        operationalOk = false;
+        write(std::string("RATE_LIVE BURST_STOP reason=") + error.what() + " continuing_order_cleanup=YES");
+    } catch (...) {
+        operationalOk = false;
+        write("RATE_LIVE BURST_STOP reason=unexpected_exception continuing_order_cleanup=YES");
+    }
+
+    // Submit all cleanup requests first; never spend N separate timeout periods.
+    const auto cleanupDeadline = Clock::now() + std::chrono::seconds(o.timeout);
+    for (auto* entry : entries) {
+        if (!entry->submitted) continue;
+        try {
+            if (!entry->lifecycle.beginCancellation(true)) continue;
+            const auto current = entry->lifecycle.current();
+            if (current.done && !current.residualUnknown) continue;
+            entry->action = basicCancelRequest(c, o, current.order, entry->reference);
+            entry->action.RequestID = entry->cancelId;
+            entry->action.OrderActionRef = entry->cancelId;
+            const int rc = api.ReqOrderAction(&entry->action, entry->cancelId);
+            entry->lifecycle.cancellationSubmitted(rc);
+            write("RATE_LIVE CALL ReqOrderAction request_id=" + std::to_string(entry->cancelId) +
+                  " order_ref=" + entry->reference + " immediate_rc=" + std::to_string(rc) +
+                  " attempt=1 (submission only)");
+        } catch (...) {
+            operationalOk = false;
+            entry->lifecycle.cancellationSubmitted(-1);
+            write("RATE_LIVE CLEANUP_ERROR order_ref=" + entry->reference + " automatic_retry=NO");
+        }
+    }
+    int traded = 0, accepted = 0, canceled = 0, unknown = 0, notAccepted = 0;
+    for (auto* entry : entries) {
+        if (!entry->submitted) continue;
+        auto result = entry->lifecycle.waitUntilDoneAt(cleanupDeadline);
+        traded += result.tradedVolume;
+        accepted += result.accepted ? 1 : 0;
+        canceled += result.canceled ? 1 : 0;
+        unknown += result.residualUnknown ? 1 : 0;
+        notAccepted += !result.accepted && !result.residualUnknown ? 1 : 0;
+        write("RATE_LIVE ORDER_RESULT order_ref=" + entry->reference +
+              " accepted=" + (result.accepted ? "YES" : "NOT_OBSERVED") +
+              " canceled=" + (result.canceled ? "YES" : "NO") +
+              " traded_volume=" + std::to_string(result.tradedVolume) +
+              " residual_order=" + (result.residualUnknown ? "UNKNOWN" : "NONE") +
+              " reason=" + result.reason);
+        if (result.residualUnknown)
+            write("RATE_LIVE OPERATOR_CHECK_REQUIRED order_ref=" + entry->reference +
+                  " instrument=" + o.instrument + " exchange=" + o.exchange +
+                  " check_and_cancel_in_counter_terminal; no automatic retry");
+    }
+    if (batch.hasFailure()) operationalOk = false;
+    if (traded > 0)
+        write("RATE_LIVE FINANCIAL_EFFECT traded_volume=" + std::to_string(traded) + " position_reversal=NOT_SENT");
+    // A modal dialog is only safe after every bounded cleanup attempt has finished.
+    const bool passed = triggerProven && operationalOk && unknown == 0;
+    write(std::string("RATE_LIVE RESULT status=") + (passed ? "PASS" : "FAIL") +
+          " rate_limit_trigger=" + (triggerProven ? "PROVEN" : "NOT_PROVEN") +
+          " sdk_insert_calls=" + std::to_string(sent) + " extra_sdk_order=NOT_SENT" +
+          " accepted_orders=" + std::to_string(accepted) + " canceled_orders=" + std::to_string(canceled) +
+          " acceptance_not_observed_closed_orders=" + std::to_string(notAccepted) +
+          " traded_volume=" + std::to_string(traded) + " residual_unknown=" + std::to_string(unknown));
+    if (triggerProven && showDialog) showRiskTriggerDialog(probe, false);
+    return passed && operationalOk;
+}
+
 bool testTrader(const Config& c, const Secrets& s, const Options& o, const fs::path& flow, Logger& log) {
     State state;
     OrderLifecycle orderLifecycle;
-    TraderSpi spi(state, log, o.test == "basic" ? &orderLifecycle : nullptr);
+    BatchOrders batchOrders;
+    TraderSpi spi(state, log, o.test == "basic" ? &orderLifecycle : nullptr,
+                  o.test == "rate-live" ? &batchOrders : nullptr);
     const std::string flowPath = flow.generic_string() + "/";
     std::string front = c.trader;
     CThostFtdcReqAuthenticateField auth{};
@@ -1486,7 +1812,9 @@ bool testTrader(const Config& c, const Secrets& s, const Options& o, const fs::p
         if (!runStage(state, log, "TRADER", Stage::Account, 3, o.timeout,
                       [&] { return api->ReqQryTradingAccount(&query, 3); })) return false;
     }
-    return o.test == "basic" ? testBasicFunction(*api, c, o, loginResult, orderLifecycle, log) : true;
+    if (o.test == "basic") return testBasicFunction(*api, c, o, loginResult, orderLifecycle, log);
+    if (o.test == "rate-live") return testLiveRateFunction(*api, c, o, loginResult, batchOrders, log);
+    return true;
 }
 bool testMd(const Config& c, const Secrets& s, const Options& o, const fs::path& flow, Logger& log) {
     State state;
@@ -1534,6 +1862,9 @@ int main(int argc, char** argv) {
                          "       --direction buy|sell --offset open|close --price PRICE\n"
                          "       [--order-goal cancel|fill] [--fill-wait 1..300]\n"
                          "       [--send-order --confirm SEND_ONE_ORDER]\n"
+                         "       --mode trader --test rate-live --instrument ID --exchange SSE|SZSE\n"
+                         "       --direction buy|sell --offset open|close --price PRICE --max-orders 1..10\n"
+                         "       [--send-order --confirm SEND_RATE_TEST_ORDERS]\n"
                          "       --test risk --risk-action settings\n"
                          "       --test risk --risk-action trigger --confirm TRIGGER_DAILY_ORDER_LIMIT\n"
                          "       --test risk --risk-action trigger-second --confirm TRIGGER_SECOND_ORDER_LIMIT\n"
@@ -1545,6 +1876,8 @@ int main(int argc, char** argv) {
                          "order-goal=fill waits up to fill-wait seconds (default 10), then attempts one cancellation.\n"
                          "Fill mode passes only on fill evidence; timeout or unknown cleanup fails. No retry/reprice.\n"
                          "Risk evidence mode displays screenshot dialogs without credentials, network, or order calls.\n"
+                         "rate-live requires budget=per-second limit N<=10 and daily remaining>=N+1; at most N one-lot orders.\n"
+                         "Without send-order rate-live is an offline plan; with it, burst once then cancel remaining orders.\n"
                          "MD-only mode does not need CTP_AUTH_CODE. No password-update operation.\n";
             return 0;
         }
@@ -1552,7 +1885,19 @@ int main(int argc, char** argv) {
         if (options.version) return 0; // help/version 不读配置、不索取密码、不连接网络。
         const Config config = readConfig(options.config, secret);
         if (options.test == "risk") return runRiskEvidence(config, options, secret) ? 0 : 1;
-        if (options.test == "basic" && options.sendOrder &&
+        if (options.test == "rate-live") {
+            validateLiveRateConfig(config, options);
+            (void)basicOrderRequest(config, options, "1");
+            if (!options.sendOrder) {
+                std::cout << "RATE_LIVE PLAN configured_limit=" << config.perSecondMaxOrderCount
+                          << " max_orders=" << options.maxOrders << " volume_per_order=1"
+                          << " instrument=" << options.instrument << " exchange=" << options.exchange
+                          << " direction=" << options.direction << " offset=" << options.offset
+                          << " limit_price=" << options.price << " transmission=NOT_REQUESTED network=NOT_CONNECTED\n";
+                return 0;
+            }
+        }
+        if ((options.test == "basic" || options.test == "rate-live") && options.sendOrder &&
             (config.dailyMaxOrderCount < 1 || config.perSecondMaxOrderCount < 1))
             throw std::runtime_error("Live order transmission requires daily_max_order_count and per_second_max_order_count in config/connection.local.ini.");
         secret.password = getSecret(secret.password, "CTP_PASSWORD", "Trading password (hidden): ");
@@ -1564,7 +1909,7 @@ int main(int argc, char** argv) {
         if (options.mode != "md") field(check.AuthCode, secret.auth, "auth_code");
         CThostFtdcQryTradingAccountField qcheck{};
         field(qcheck.InvestorID, config.investor, "investor_id");
-        if (options.test == "basic") (void)basicOrderRequest(config, options, "1");
+        if (options.test == "basic" || options.test == "rate-live") (void)basicOrderRequest(config, options, "1");
         std::string runId;
         const fs::path logDir = createRunLogDirectory(runId);
         fs::create_directories("flow");
@@ -1594,6 +1939,10 @@ int main(int argc, char** argv) {
                                            (options.orderGoal == "fill" ? "; bounded fill wait, cancel remainder on timeout"
                                                                          : "; cancel on queueing")
                                          : "dry-run only; no order transmitted"));
+        } else if (options.test == "rate-live") {
+            log.write("SCOPE connect/auth/login/read-only-account-query; live per-second risk test; max_orders=" +
+                      std::to_string(options.maxOrders) +
+                      " volume_per_order=1 one_burst=YES automatic_retry=NO automatic_reprice=NO cancel_remaining=YES");
         } else {
             log.write("SCOPE connect/auth/login/read-only-account-query; no market subscription, order, cancel, settlement or password change");
         }
@@ -1604,7 +1953,8 @@ int main(int argc, char** argv) {
         log.write(std::string("RESULT overall=") + (traderOk && mdOk ? "PASS" : "FAIL") +
                   " trader=" + (options.mode == "md" ? "NOT_RUN" : traderOk ? "PASS" : "FAIL") +
                   " md=" + (options.mode == "trader" ? "NOT_RUN" : mdOk ? "PASS" : "FAIL") +
-                  " basic=" + (options.test != "basic" ? "NOT_RUN" : traderOk ? "PASS" : "FAIL"));
+                  " basic=" + (options.test != "basic" ? "NOT_RUN" : traderOk ? "PASS" : "FAIL") +
+                  " rate_live=" + (options.test != "rate-live" ? "NOT_RUN" : traderOk ? "PASS" : "FAIL"));
         log.write("EVIDENCE log=" + fs::absolute(logDir / "run.log").string());
         log.write("NEXT successful login should be reported to broker the same day; this program does not notify anyone");
         return traderOk && mdOk ? 0 : 1;
