@@ -8,6 +8,8 @@
 - 离线回归增加 6 项，覆盖配置覆盖、数值范围、自测确认令牌、阈值边界、持久与交易日重置、损坏状态默认拒绝；连同既有测试共 36 项。
 - 当前维护环境不能显示 Windows `MessageBoxW`，因此弹窗外观和 MSVC 构建仍需用户拉取后在 Windows x64 实机复核。正式截图必须在 `daily_max_order_count` 已填为报备表值时现场生成。
 - 用户首次 Windows 构建暴露 `MessageBoxW` 缺少 `User32.lib` 的链接错误；直接构建脚本与 CMake 入口均已加入 `user32`。Windows 环境变量读取同时改用 `_dupenv_s`，消除 MSVC 的 C4996 `getenv` 警告。
+- 后续 Windows 构建暴露该修改中的局部变量重名：环境变量缓冲区与隐藏输入字符串均叫 `value`。已将缓冲区改名为 `environmentBuffer`，修复 C2371 及其引发的 C2039；不改变凭据优先级、隐藏输入或风控逻辑。
+- 回归入口新增 Windows 凭据分支检查：从当前 `src/main.cpp` 提取原函数，用 Windows API 测试替身编译并执行 8 个场景。改名前复现同类编译错误，改名后 8 项、既有 36 项及 POSIX 隐藏输入检查全部通过；C++17 源码语法检查通过。该测试不依赖 SDK 库、不连接柜台，也不等同于 Windows/MSVC 原生构建或真实控制台验证。
 
 ## v0.2.2：中文 SDK 消息正常显示
 

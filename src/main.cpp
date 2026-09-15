@@ -267,8 +267,8 @@ std::string getSecret(const std::string& configured, const char* envName, const 
     std::size_t length = 0;
     if (_dupenv_s(&duplicated, &length, envName) != 0)
         throw std::runtime_error(std::string("Cannot read environment variable: ") + envName);
-    std::unique_ptr<char, decltype(&std::free)> value(duplicated, &std::free);
-    if (value && *value) return value.get();
+    std::unique_ptr<char, decltype(&std::free)> environmentBuffer(duplicated, &std::free);
+    if (environmentBuffer && *environmentBuffer) return environmentBuffer.get();
 #else
     if (const char* value = std::getenv(envName); value && *value) return value;
 #endif

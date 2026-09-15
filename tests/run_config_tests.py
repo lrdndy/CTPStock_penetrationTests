@@ -53,6 +53,27 @@ def prompt_test(binary):
         os.close(slave)
 
 
+def windows_credential_branch_test(root, build, compiler):
+    """Compile actual Windows getSecret code with test doubles even on Linux.
+
+    This catches conditional-branch scope/type errors, not Windows SDK linking.
+    """
+    text = (root / "src" / "main.cpp").read_text(encoding="utf-8")
+    start = text.index("std::string getSecret(")
+    end = text.index("\nstd::tm localTime(", start)
+    (build / "get_secret_under_test.inc").write_text(text[start:end], encoding="utf-8")
+    source = root / "tests" / "windows_get_secret_test.cpp"
+    binary = build / ("windows_credentials.exe" if os.name == "nt" else "windows_credentials")
+    if Path(compiler).name.lower() in {"cl", "cl.exe"}:
+        command = [compiler, "/nologo", "/std:c++17", "/EHsc", "/utf-8", "/W4",
+                   f"/I{build}", str(source), f"/Fe:{binary}"]
+    else:
+        command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-pedantic",
+                   "-I", str(build), str(source), "-o", str(binary)]
+    subprocess.run(command, cwd=build, check=True)
+    subprocess.run([str(binary)], stdin=subprocess.DEVNULL, check=True)
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     compiler = os.environ.get("CXX") or ("cl" if os.name == "nt" else "g++")
@@ -72,6 +93,7 @@ def main():
         subprocess.run(command, cwd=build, check=True)
         subprocess.run([str(binary), str(build / "fixtures")], stdin=subprocess.DEVNULL, check=True)
         prompt_test(binary)
+        windows_credential_branch_test(root, build, compiler)
     print("Offline tests complete. Live login and Windows console behavior are separate checks.")
 
 
