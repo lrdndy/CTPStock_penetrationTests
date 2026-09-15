@@ -19,7 +19,8 @@ target_include_directories(ctp_stock_connect SYSTEM PRIVATE "${CMAKE_CURRENT_SOU
 target_link_libraries(ctp_stock_connect PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/sdk/win64/soptthosttraderapi_se.lib"
   "${CMAKE_CURRENT_SOURCE_DIR}/sdk/win64/soptthostmduserapi_se.lib"
-  advapi32)
+  advapi32
+  user32)
 set_property(TARGET ctp_stock_connect PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_target_properties(ctp_stock_connect PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)

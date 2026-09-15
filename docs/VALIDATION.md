@@ -7,6 +7,7 @@
 - 新增 `run_risk_windows.bat settings|trigger`。设置弹窗显示正式阈值和口径；触发自测使用与实发共用的判断函数，但不读写真实计数、不索取凭据、不连网、不发单，并在弹窗/日志中明示这一点。
 - 离线回归增加 6 项，覆盖配置覆盖、数值范围、自测确认令牌、阈值边界、持久与交易日重置、损坏状态默认拒绝；连同既有测试共 36 项。
 - 当前维护环境不能显示 Windows `MessageBoxW`，因此弹窗外观和 MSVC 构建仍需用户拉取后在 Windows x64 实机复核。正式截图必须在 `daily_max_order_count` 已填为报备表值时现场生成。
+- 用户首次 Windows 构建暴露 `MessageBoxW` 缺少 `User32.lib` 的链接错误；直接构建脚本与 CMake 入口均已加入 `user32`。Windows 环境变量读取同时改用 `_dupenv_s`，消除 MSVC 的 C4996 `getenv` 警告。
 
 ## v0.2.2：中文 SDK 消息正常显示
 

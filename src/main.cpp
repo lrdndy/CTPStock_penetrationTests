@@ -262,7 +262,16 @@ std::string orderPlanText(const Options& o, const std::string& orderRef) {
 }
 std::string getSecret(const std::string& configured, const char* envName, const char* prompt) {
     if (!configured.empty()) return configured;
+#ifdef _WIN32
+    char* duplicated = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&duplicated, &length, envName) != 0)
+        throw std::runtime_error(std::string("Cannot read environment variable: ") + envName);
+    std::unique_ptr<char, decltype(&std::free)> value(duplicated, &std::free);
+    if (value && *value) return value.get();
+#else
     if (const char* value = std::getenv(envName); value && *value) return value;
+#endif
     std::cout << prompt << std::flush;
 #ifdef _WIN32
     const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);

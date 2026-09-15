@@ -32,7 +32,7 @@ if errorlevel 1 exit /b 1
 if not exist build\bin mkdir build\bin
 if not exist build\obj mkdir build\obj
 rem SDK headers under sdk/include are UTF-8 copies; sdk/win64 is original.
-cl.exe /nologo /std:c++17 /EHsc /W4 /utf-8 /O2 /MT /DWIN32 /DISLIB /DNOMINMAX /DWIN32_LEAN_AND_MEAN /external:Isdk\include /external:W0 /Fo:build\obj\main.obj /Fe:build\bin\ctp_stock_connect.exe src\main.cpp /link /MACHINE:X64 /LIBPATH:sdk\win64 soptthosttraderapi_se.lib soptthostmduserapi_se.lib advapi32.lib
+cl.exe /nologo /std:c++17 /EHsc /W4 /utf-8 /O2 /MT /DWIN32 /DISLIB /DNOMINMAX /DWIN32_LEAN_AND_MEAN /external:Isdk\include /external:W0 /Fo:build\obj\main.obj /Fe:build\bin\ctp_stock_connect.exe src\main.cpp /link /MACHINE:X64 /LIBPATH:sdk\win64 soptthosttraderapi_se.lib soptthostmduserapi_se.lib advapi32.lib user32.lib
 if errorlevel 1 exit /b 1
 copy /y sdk\win64\soptthosttraderapi_se.dll build\bin\ >nul
 if errorlevel 1 exit /b 1
