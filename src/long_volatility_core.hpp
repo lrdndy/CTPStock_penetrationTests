@@ -4,13 +4,13 @@
 // Include after main.cpp: reuse the existing request builder, lifecycle and
 // cross-process daily/rolling-second guard; no second set of counters.
 namespace long_vol {
-constexpr const char* version = "v0.1.0";
+constexpr const char* version = "v0.1.1";
 constexpr const char* confirmation = "SEND_LONG_VOLATILITY_ORDERS";
 struct Settings {
     std::string config = "config/connection.ini", exchange = "SSE", call, put, confirm;
     double callPrice = 0, putPrice = 0;
     int timeout = 60, fillWait = 10;
-    bool send = false, noPrompt = false, help = false;
+    bool send = false, help = false;
 };
 struct Leg {
     std::string label, instrument, source;

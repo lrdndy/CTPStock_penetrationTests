@@ -75,6 +75,35 @@ struct Capture {
     std::streambuf* previous = std::cout.rdbuf(text.rdbuf());
     ~Capture() { std::cout.rdbuf(previous); }
 };
+struct StdinFixture {
+    std::istringstream values{"10000001\n10000002\n0.04\n0.06\nfixture-secret\n"};
+    std::streambuf* previous = std::cin.rdbuf(values.rdbuf());
+    ~StdinFixture() { std::cin.rdbuf(previous); }
+    void untouched() { require(values.tellg() == 0, "Interactive input was consumed"); }
+};
+struct EnvironmentFixture {
+    const char* name = "CTP_LONG_VOL_TEST_SECRET";
+    std::string previous;
+    bool existed = false;
+    EnvironmentFixture() {
+#ifdef _WIN32
+        char* value = nullptr; std::size_t length = 0;
+        if (_dupenv_s(&value, &length, name) != 0) throw std::runtime_error("Cannot read test environment");
+        std::unique_ptr<char, decltype(&std::free)> buffer(value, &std::free);
+        if (buffer) { existed = true; previous = buffer.get(); }
+#else
+        if (const char* value = std::getenv(name)) { existed = true; previous = value; }
+#endif
+    }
+    void set(const char* value) {
+#ifdef _WIN32
+        require(_putenv_s(name, value ? value : "") == 0, "Cannot set test environment");
+#else
+        require((value ? setenv(name, value, 1) : unsetenv(name)) == 0, "Cannot set test environment");
+#endif
+    }
+    ~EnvironmentFixture() { try { set(existed ? previous.c_str() : nullptr); } catch (...) {} }
+};
 bool execute(Api& api, const Config& c, const Settings& s, const std::array<Leg, 2>& legs,
              BatchOrders& batch, std::string& output, const std::function<void()>& pace = [] {}) {
     Secrets secret; Logger log("run.log", secret); Capture capture;
@@ -105,9 +134,49 @@ int main(int argc, char** argv) {
             require(cli({"--call-price", "0.0427", "--put-price", "0.06"}).callPrice == 0.0427, "Manual input changed");
         });
         test("contract inputs require distinct option codes", [] {
-            auto s = settings(); long_vol::completeContracts(s);
-            s.call = s.put; rejects([&] { long_vol::completeContracts(s); });
-            s.call = "510050"; rejects([&] { long_vol::completeContracts(s); });
+            auto s = settings(); long_vol::validateContracts(s);
+            s.call = s.put; rejects([&] { long_vol::validateContracts(s); });
+            s.call = "510050"; rejects([&] { long_vol::validateContracts(s); });
+        });
+        test("missing contracts reject without reading stdin or requiring no-prompt", [] {
+            StdinFixture input; Capture output;
+            for (const auto& args : {std::vector<std::string>{}, {"--call", "10000001"}, {"--put", "10000002"}, {"--no-prompt"}}) {
+                auto s = cli(args); rejects([&] { long_vol::validateContracts(s); });
+            }
+            auto s = cli({"--call", "10000001", "--put", "10000002", "--no-prompt"});
+            long_vol::validateContracts(s);
+            input.untouched(); require(output.text.str().empty(), "Printed an interactive prompt");
+        });
+        test("command prices bypass quotes and omitted prices use automatic quotes", [] {
+            StdinFixture input; auto legs = pair(); int queries = 0;
+            auto ask = [&](Leg& leg) { ++queries; leg.price = 0.0627; leg.source = "FAKE_ASK"; leg.deadline = Clock::now() + std::chrono::seconds(5); };
+            legs[0].deadline = Clock::now() - std::chrono::seconds(1);
+            long_vol::resolvePrice(legs[0], 0.0427, "--call-price", ask);
+            require(queries == 0 && legs[0].price == 0.0427 && legs[0].deadline == Clock::time_point::max(), "Manual price queried or expired");
+            long_vol::resolvePrice(legs[1], 0, "--put-price", ask);
+            require(queries == 1 && legs[1].price == 0.0627 && legs[1].source == "FAKE_ASK", "Automatic quote was ignored");
+            rejects([&] { long_vol::resolvePrice(legs[0], 0.04275, "--call-price", ask); });
+            input.untouched();
+        });
+        test("unavailable automatic quotes fail with command flag instead of stdin fallback", [] {
+            StdinFixture input; Capture output; auto legs = pair();
+            for (std::size_t i = 0; i < legs.size(); ++i) {
+                const char* option = i ? "--put-price" : "--call-price";
+                std::string error;
+                try { long_vol::resolvePrice(legs[i], 0, option, [](Leg&) { throw std::runtime_error("FAKE_QUOTE_UNAVAILABLE"); }); }
+                catch (const std::exception& e) { error = e.what(); }
+                require(error.find(option) != std::string::npos && error.find("FAKE_QUOTE_UNAVAILABLE") != std::string::npos, "Missing actionable quote failure");
+            }
+            input.untouched(); require(output.text.str().empty(), "Printed an interactive price prompt");
+        });
+        test("credentials use configuration then environment and never read stdin", [] {
+            StdinFixture input; Capture output; EnvironmentFixture environment;
+            environment.set("ENV_FIXTURE");
+            require(long_vol::nonInteractiveSecret("CONFIG_FIXTURE", environment.name) == "CONFIG_FIXTURE", "Config precedence changed");
+            require(long_vol::nonInteractiveSecret("", environment.name) == "ENV_FIXTURE", "Environment credential lost");
+            environment.set(""); rejects([&] { long_vol::nonInteractiveSecret("", environment.name); });
+            environment.set(nullptr); rejects([&] { long_vol::nonInteractiveSecret("", environment.name); });
+            input.untouched(); require(output.text.str().empty(), "Printed a credential prompt");
         });
         test("pair validation rejects wrong type underlying expiry strike or exchange", [] {
             const auto base = pair(); long_vol::validatePair(base, "SSE", "20260915");

@@ -14,7 +14,7 @@ Settings parse(int argc, char** argv) {
         if (!seen.insert(arg).second) throw std::runtime_error("参数重复：" + arg);
         if (arg == "--help" || arg == "-h") { s.help = true; continue; }
         if (arg == "--send-order") { s.send = true; continue; }
-        if (arg == "--no-prompt") { s.noPrompt = true; continue; }
+        if (arg == "--no-prompt") continue; // Compatibility: every run is now noninteractive.
         if (arg != "--config" && arg != "--exchange" && arg != "--call" && arg != "--put" &&
             arg != "--call-price" && arg != "--put-price" && arg != "--confirm" &&
             arg != "--timeout" && arg != "--fill-wait") throw std::runtime_error("未知参数：" + arg);
@@ -40,20 +40,41 @@ Settings parse(int argc, char** argv) {
     if (!s.send && !s.confirm.empty()) throw std::runtime_error("演练模式不接受实发确认口令。");
     return s;
 }
-std::string input(const std::string& question, bool noPrompt) {
-    if (noPrompt) throw std::runtime_error("缺少输入或有效行情，--no-prompt 模式已停止。");
-    std::cout << "做多波动率策略：" << question << std::flush;
-    std::string value;
-    if (!std::getline(std::cin, value) || trim(value).empty()) throw std::runtime_error("未提供输入，已停止。");
-    return trim(value);
-}
-void completeContracts(Settings& s) {
-    if (s.call.empty()) s.call = input("请输入认购期权合约代码：", s.noPrompt);
-    if (s.put.empty()) s.put = input("请输入认沽期权合约代码：", s.noPrompt);
+void validateContracts(const Settings& s) {
+    if (s.call.empty()) throw std::runtime_error("缺少认购合约，请在命令中指定 --call 认购代码。");
+    if (s.put.empty()) throw std::runtime_error("缺少认沽合约，请在命令中指定 --put 认沽代码。");
     for (const auto& id : {s.call, s.put})
         if (id.size() != 8 || id.find_first_not_of("0123456789") != std::string::npos)
             throw std::runtime_error("请输入 8 位股票期权合约代码，不能填写 ETF 代码。");
     if (s.call == s.put) throw std::runtime_error("认购和认沽不能使用同一个合约代码。");
+}
+
+std::string nonInteractiveSecret(const std::string& configured, const char* envName) {
+    if (!configured.empty()) return configured;
+#ifdef _WIN32
+    char* duplicated = nullptr; std::size_t length = 0;
+    if (_dupenv_s(&duplicated, &length, envName) != 0)
+        throw std::runtime_error(std::string("无法读取凭据环境变量：") + envName);
+    std::unique_ptr<char, decltype(&std::free)> environmentBuffer(duplicated, &std::free);
+    if (environmentBuffer && *environmentBuffer) return environmentBuffer.get();
+#else
+    if (const char* environmentValue = std::getenv(envName); environmentValue && *environmentValue)
+        return environmentValue;
+#endif
+    throw std::runtime_error(std::string("缺少凭据，请在本地配置或环境变量 ") + envName + " 中设置；本程序不进行交互输入。");
+}
+
+void resolvePrice(Leg& leg, double manual, const char* option, const std::function<void(Leg&)>& ask) {
+    if (manual != 0) {
+        leg.price = manual; leg.source = "命令行指定限价"; leg.deadline = Clock::time_point::max();
+    } else {
+        try { ask(leg); }
+        catch (const std::exception& e) {
+            throw std::runtime_error(leg.label + "无法自动报价，原因=" + e.what() +
+                " 请在命令中指定 " + option + " 买入限价 后重新运行；本次未报单。");
+        }
+    }
+    validatePrice(leg);
 }
 
 // One outstanding query per type. Only the matching final callback completes it.
@@ -151,7 +172,7 @@ bool run(const Config& c, const Secrets& secret, const Settings& s, const fs::pa
     field(account.BrokerID, c.broker, "broker_id"); field(account.InvestorID, c.investor, "investor_id");
     // Request buffers and batch remain alive until API Release has joined its threads.
     std::array<CThostFtdcQryInstrumentField, 2> contractRequests{};
-    std::array<CThostFtdcQryDepthMarketDataField, 4> quoteRequests{};
+    std::array<CThostFtdcQryDepthMarketDataField, 2> quoteRequests{};
     std::array<Leg, 2> legs{};
     legs[0].label = "认购腿"; legs[0].instrument = s.call;
     legs[1].label = "认沽腿"; legs[1].instrument = s.put;
@@ -196,23 +217,9 @@ bool run(const Config& c, const Secrets& secret, const Settings& s, const fs::pa
         if (!useAsk(leg, q, s, day, serverSeconds, now)) throw std::runtime_error("无有效卖一价、无卖盘数量、行情过期或时间信息不完整。");
         log.write("做多波动率策略：" + leg.label + "行情卖一=" + number(leg.price) + " 行情时间=" + textField(q.UpdateTime));
     };
-    bool prompted = false;
-    for (std::size_t i = 0; i < 2; ++i) {
-        auto& leg = legs[i]; const double manual = i == 0 ? s.callPrice : s.putPrice;
-        if (manual > 0) { leg.price = manual; leg.source = "手动指定限价"; }
-        else {
-            try { ask(leg); }
-            catch (const std::exception& e) {
-                log.write("做多波动率策略：" + leg.label + "无法自动报价，原因=" + e.what());
-                leg.price = decimalPrice(input(leg.label + "请手动输入买入限价：", s.noPrompt));
-                leg.source = "行情不可用，手动输入限价"; leg.deadline = Clock::time_point::max(); prompted = true;
-            }
-        }
-        validatePrice(leg);
-    }
-    // All manual input happens before the first order. Refresh any automatic
-    // quote after an interactive pause; never reuse a pre-prompt stale quote.
-    if (prompted) for (auto& leg : legs) if (leg.source == "行情卖一价（限价报单）") ask(leg);
+    // Resolve both prices before execute can send the first order. No stdin fallback.
+    resolvePrice(legs[0], s.callPrice, "--call-price", ask);
+    resolvePrice(legs[1], s.putPrice, "--put-price", ask);
     if (!spi.connected || batch.hasFailure()) throw std::runtime_error("连接异常，禁止开始双腿报单。");
     log.write("做多波动率策略：两腿各买入开仓 1 张；顺序发送，中间间隔约 1.1 秒；不保证同时成交。");
     return execute(*api, c, s, loginResult.login, legs, batch, log);
@@ -228,19 +235,20 @@ int application(int argc, char** argv) {
             std::cout << "做多波动率策略（买入跨式） " << version << "\n"
                 "--call 认购代码 --put 认沽代码 --exchange SSE|SZSE\n"
                 "--call-price 价格 --put-price 价格：可选，手动指定买入限价。\n"
-                "不指定价格：查询有效卖一价；查询失败则提示手动输入。\n"
-                "--timeout 1..300 --fill-wait 1..300 --config 文件 --no-prompt\n"
+                "不指定价格：查询有效卖一价；查询失败即退出，请补充价格参数后重新运行。\n"
+                "合约代码必须在命令中指定，凭据读取本地配置或环境变量；不进行交互输入。\n"
+                "--timeout 1..300 --fill-wait 1..300 --config 文件\n"
                 "默认只查询并演练，不报单。实发两腿须同时给出：\n"
                 "--send-order --confirm SEND_LONG_VOLATILITY_ORDERS\n"
                 "每腿固定买入开仓 1 张，均为限价单；不保证成交，不自动追价或平仓。\n";
             return 0;
         }
-        completeContracts(s);
+        validateContracts(s);
         const Config c = readConfig(s.config, secret);
         if (s.send && (c.dailyMaxOrderCount < 2 || c.perSecondMaxOrderCount < 1))
             throw std::runtime_error("请按报备表配置每日及每秒报单上限；本策略需至少 2 笔每日报单额度。");
-        secret.password = getSecret(secret.password, "CTP_PASSWORD", "交易密码（隐藏输入）：");
-        secret.auth = getSecret(secret.auth, "CTP_AUTH_CODE", "认证码（隐藏输入）：");
+        secret.password = nonInteractiveSecret(secret.password, "CTP_PASSWORD");
+        secret.auth = nonInteractiveSecret(secret.auth, "CTP_AUTH_CODE");
         std::string runId; const auto logDir = createRunLogDirectory(runId); Logger log(logDir / "run.log", secret);
         log.write(std::string("做多波动率策略：启动 strategy_version=") + version + " connectivity_version=" + kVersion);
         log.write(std::string("交易 API：") + CThostFtdcTraderApi::GetApiVersion());

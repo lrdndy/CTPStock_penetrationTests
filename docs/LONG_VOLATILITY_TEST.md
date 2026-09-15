@@ -1,6 +1,6 @@
 # 做多波动率策略测试（买入跨式）
 
-独立程序 `build\bin\ctp_long_vol.exe`，策略版本 `v0.1.0`。它复用项目已有连接、登录、订单状态处理、每日及每秒风控；原有测试入口和 SDK 文件不变。终端和证据日志显示中文“做多波动率策略”及每条腿的执行结果。
+独立程序 `build\bin\ctp_long_vol.exe`，策略版本 `v0.1.1`。它复用项目已有连接、登录、订单状态处理、每日及每秒风控；原有测试入口和 SDK 文件不变。终端和证据日志显示中文“做多波动率策略”及每条腿的执行结果。**所有运行均不进行交互输入：合约与可选价格直接写在命令中。**
 
 ## 策略内容
 
@@ -15,38 +15,42 @@
 ```powershell
 git pull origin master
 .\build_long_vol_windows.bat
-.\run_long_vol_windows.bat
+.\run_long_vol_windows.bat --help
 ```
 
-首次编译使用原项目 `sdk\include`、`sdk\win64` 中的 3.7.5 Windows x64 头文件、LIB 和两只本地 DLL。无需添加新的 SDK 文件。配置仍读取 `config\connection.ini`，自动叠加 `config\connection.local.ini`。
+首次编译使用原项目 `sdk\include`、`sdk\win64` 中的 3.7.5 Windows x64 头文件、LIB 和两只本地 DLL。无需添加新的 SDK 文件。配置仍读取 `config\connection.ini`，自动叠加 `config\connection.local.ini`。密码和认证码优先使用本地配置，否则读取 `CTP_PASSWORD`、`CTP_AUTH_CODE` 环境变量；缺失时直接报错退出，不询问隐藏输入，也不通过命令行传递凭据。
 
-不填写合约时，程序用中文依次询问认购、认沽的 **8 位期权合约代码**，不是 ETF 代码。默认运行会连接、认证、登录并进行账户、合约和报价查询，然后打印双腿计划；不会报单，也不会把演练记为成交通过。
+必须使用 `--call`、`--put` 指定两条腿的 **8 位期权合约代码**，不是 ETF 代码；缺少或格式不符时在连接前报错退出。以下命令中的 `CALL_CODE`、`PUT_CODE` 需要替换为经核对的认购、认沽代码，不能原样执行。程序不推算或猜测另一条腿。
 
-真实报单命令：
+自动查询两腿卖一价，先只演练：
 
 ```powershell
-.\run_long_vol_windows.bat --send-order --confirm SEND_LONG_VOLATILITY_ORDERS
+.\run_long_vol_windows.bat --call CALL_CODE --put PUT_CODE --exchange SSE --fill-wait 10 --timeout 60
 ```
 
-这个命令最多买入两张期权，可能增加真实持仓。合约代码和缺失价格会在第一笔报单前询问。程序没有默认认购／认沽代码，不推算或猜测另一条腿。凭据沿用原项目的本地配置或隐藏输入。
+默认运行会连接、认证、登录并进行账户、合约和报价查询，然后打印双腿计划；不会报单，也不会把演练记为成交通过。
 
-也可在命令中指定参数：
+自动查询卖一价并真实报单：
 
 ```powershell
-$callCode = Read-Host '认购期权代码'
-$putCode = Read-Host '认沽期权代码'
-.\run_long_vol_windows.bat --call $callCode --put $putCode --exchange SSE --fill-wait 10 --timeout 60
+.\run_long_vol_windows.bat --call CALL_CODE --put PUT_CODE --exchange SSE --fill-wait 10 --timeout 60 --send-order --confirm SEND_LONG_VOLATILITY_ORDERS
 ```
 
-上例仍为演练。需要发送时添加同一组 `--send-order --confirm SEND_LONG_VOLATILITY_ORDERS`。
+直接在命令中给出两腿买入限价并真实报单（还需将 `CALL_PRICE`、`PUT_PRICE` 替换为各腿的数字限价）：
 
-## 报价和手动输入
+```powershell
+.\run_long_vol_windows.bat --call CALL_CODE --put PUT_CODE --exchange SSE --call-price CALL_PRICE --put-price PUT_PRICE --fill-wait 10 --timeout 60 --send-order --confirm SEND_LONG_VOLATILITY_ORDERS
+```
 
-- **未传价格**：使用交易 API 的行情查询取得卖一价和卖一量。核对合约、交易日、行情时间、卖盘数量及可用的涨跌停价格。行情时间以登录返回的柜台时间加经过时长校验；超过 10 秒、时间不完整、无卖盘或查询失败时提示手动输入买入限价。
-- **手动指定**：使用 `--call-price` 和 `--put-price` 分别给出两腿限价。可只给一条腿，另一条腿仍自动查询。价格须为正的十进制数字，并满足查询得到的最小变动价位。
+带有发送开关和确认口令的命令最多买入两张期权，可能增加真实持仓。两腿价格均在第一笔报单前确定；自动报价不可用时本次不发任何订单，不会停下来等待输入。
+
+## 报价和命令行指定价格
+
+- **未传价格**：使用交易 API 的行情查询取得卖一价和卖一量。核对合约、交易日、行情时间、卖盘数量及可用的涨跌停价格。行情时间以登录返回的柜台时间加经过时长校验；达到 10 秒、时间不完整、无卖盘或查询失败时直接退出，并提示补充对应的 `--call-price` 或 `--put-price` 后重新运行。
+- **命令行指定**：使用 `--call-price` 和 `--put-price` 分别给出两腿限价。可只给一条腿，另一条腿仍自动查询；两腿都给出时不查询卖一价。价格须为正的十进制数字，并满足查询得到的最小变动价位，不能包含字母或科学计数法。
 - 两种来源都发 **限价委托**。自动报价相当于取当时市场卖一价作为买入限价，日志会写“行情卖一价（限价报单）”。它不是无限价的交易所市价委托；行情变化、卖盘消失或无撮合对手时仍可能不成交。不会自动加价或反复追单。
-- 手动价格由操作者决定，不声称它就是实时市价。程序在第一笔报单前完成全部手动输入；如输入等待使另一腿的自动报价变旧，会重新查询一次。发单前再次检查自动报价有效期，过期即停止，不继续使用旧价。
-- `--no-prompt` 禁止合约和价格询问：缺少合约或无法获得有效自动报价时直接失败；凭据仍使用原项目的读取及隐藏输入机制。`--timeout`、`--fill-wait` 均为 `1..300` 秒，默认分别为 `60` 和 `10`。
+- 命令中的价格由操作者决定，不声称它就是实时市价。发单前再次检查自动报价有效期，过期即停止，不继续使用旧价。
+- 不再需要 `--no-prompt`；为兼容旧命令仍接受此选项，但不改变行为。`--timeout`、`--fill-wait` 均为 `1..300` 秒，默认分别为 `60` 和 `10`。
 
 ## 成交与失败判定
 
@@ -71,12 +75,12 @@ $putCode = Read-Host '认沽期权代码'
 
 ## 验证范围
 
-实现位于 `src/long_volatility.cpp`（参数、中文输入、连接与查询）和 `src/long_volatility_core.hpp`（配对、报价校验与双腿执行）；通过包含现有 `src/main.cpp` 复用公共逻辑，不调用原程序的入口函数。新增文件的校验值见 `LONG_VOL_SHA256SUMS.txt`。旧的打包脚本没有自动加入这个独立 EXE；交付软件包时需将新 EXE 与运行脚本一并包含，并对最终压缩包重新计算校验值。
+实现位于 `src/long_volatility.cpp`（命令行参数、凭据读取、连接与查询）和 `src/long_volatility_core.hpp`（配对、报价校验与双腿执行）；通过包含现有 `src/main.cpp` 复用公共逻辑，不调用原程序的入口函数。新增文件的校验值见 `LONG_VOL_SHA256SUMS.txt`。旧的打包脚本没有自动加入这个独立 EXE；交付软件包时需将新 EXE 与运行脚本一并包含，并对最终压缩包重新计算校验值。
 
 ```powershell
 py tests\run_long_vol_tests.py
 ```
 
-也可在 Linux 用 `python3 tests/run_long_vol_tests.py`。22 项假 SDK 测试覆盖参数确认、合约配对、行情时效、手动价格语法和价位、两腿成交、第一腿终结、第二腿拒绝、超时撤单、残单、提交异常、每日／每秒风控和跨入口计数一致性。测试不会连接柜台或真实报单。
+也可在 Linux 用 `python3 tests/run_long_vol_tests.py`。26 项离线测试覆盖参数确认、缺少合约直接退出、指定价格跳过行情查询、行情失败提示价格参数、凭据配置／环境变量优先级、无标准输入读取，以及合约配对、行情时效、价格语法和价位、两腿成交、第一腿终结、第二腿拒绝、超时撤单、残单、提交异常、每日／每秒风控和跨入口计数一致性。测试使用假 SDK，不会连接柜台或真实报单。
 
 完整策略源码另通过 Linux C++17 语法检查。Windows/MSVC 编译、实际柜台查询和成交尚需在用户机器验证。每次运行的日志路径打印为 `EVIDENCE log=...`，可用终端中文结果和实际成交明细制作报告截图。
